@@ -1,0 +1,21 @@
+[package]
+name = "sparrow_engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+html5ever = "0.26"
+taffy = { version = "0.4", default-features = false, features = ["std", "taffy_tree", "flexbox", "block_layout"] }
+boa_engine = { version = "0.17", default-features = false }
+tiny-skia = { version = "0.11", default-features = false, features = ["std"] }
+reqwest = { version = "0.11", default-features = false, features = ["blocking", "rustls-tls"] }
+rusqlite = { version = "0.30", features = ["bundled"] }
+url = "2.4"
+encoding_rs = "0.8"
+
+[profile.release]
+lto = true
+opt-level = 3
+strip = true
+codegen-units = 1
+panic = "unwind"   # "abort" breaks catch_unwind
