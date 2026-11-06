@@ -616,3 +616,18 @@ Measure first: add `criterion` benches for parse, style, layout, paint on fixed 
 ---
 
 *Owner: Kaif Alvi · Org: Codone · Project: Sparrow Browser. Keep this file current — it is the single source of truth for humans and AI assistants working on the engine.*
+
+---
+
+## Addendum — Phase 3 (fonts, media, tracker blocking)
+
+| Module | Purpose | Verified |
+|---|---|---|
+| `dro_font.rs` | system fonts (`fontdb`) + OpenType shaping (`rustybuzz`) + AA outline rendering (tiny-skia); Bangla/Indic conjuncts, ligatures, per-char font fallback | compiled, 2 tests, rendered PNG checked visually |
+| `dro_media.rs` | pure-Rust audio player: `symphonia` decode, linear resampler, `cpal` output, audio-clock master, seek/volume/mute; animated GIF video; MP4 probe | compiled, 4 tests |
+| `dro_media_ui.rs` | Chromium-style control bar (play/pause, time, progress, mute, volume) draw + hit-test | compiled, 3 tests |
+| `sparrow_engine/media_bridge.rs` | `<video>/<audio>` slots, threaded download, JS commands, frame upload, overlay, click/key | type-checked against a stub engine |
+| `dro_blocklist.rs` | third-party tracker/ad blocking for sub-resources, hosts/ABP-style lists | compiled, 3 tests |
+| `dom_bootstrap.js` | + `HTMLMediaElement` API (`play/pause/currentTime/volume/muted/duration`, events) | 33 Node checks |
+
+Not available in pure Rust today: H.264 / VP9 video decoding (only AV1 via `rav1d`, needs rustc >= 1.79). MP4/WebM audio plays; their pictures do not yet.

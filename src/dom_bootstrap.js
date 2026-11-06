@@ -498,6 +498,30 @@
   g.cancelAnimationFrame = g.clearTimeout;
   g.queueMicrotask = function (f) { g.setTimeout(f, 0); };
 
+  // ---------- <video>/<audio> (HTMLMediaElement). Rust owns playback; JS queues commands "idx|op|value". ----------
+  var mq = [];
+  function mediaList() { return desc(document).filter(function (n) { return n.nodeType === 1 && (n.localName === 'video' || n.localName === 'audio'); }); }
+  function mIdx(el) { return mediaList().indexOf(el); }
+  function mst(el) { return el._m || (el._m = { paused: true, t: 0, d: NaN, v: 1, muted: false, ended: false }); }
+  EP.play = function () { var s = mst(this); s.paused = false; mq.push(mIdx(this) + '|play|'); return Promise.resolve(); };
+  EP.pause = function () { var s = mst(this); s.paused = true; mq.push(mIdx(this) + '|pause|'); };
+  EP.load = function () { mq.push(mIdx(this) + '|load|' + (this._a.src || '')); };
+  EP.canPlayType = function (t) { t = String(t).toLowerCase(); return (t.indexOf('audio/') === 0 || t.indexOf('mp4') > 0 || t.indexOf('ogg') > 0 || t.indexOf('mpeg') > 0 || t.indexOf('wav') > 0 || t.indexOf('flac') > 0) ? 'maybe' : ''; };
+  def(EP, 'paused', function () { return mst(this).paused; });
+  def(EP, 'ended', function () { return mst(this).ended; });
+  def(EP, 'duration', function () { return mst(this).d; });
+  def(EP, 'readyState', function () { return isNaN(mst(this).d) ? 0 : 4; });
+  def(EP, 'currentTime', function () { return mst(this).t; }, function (v) { mst(this).t = +v || 0; mq.push(mIdx(this) + '|seek|' + (+v || 0)); });
+  def(EP, 'volume', function () { return mst(this).v; }, function (v) { mst(this).v = Math.max(0, Math.min(1, +v)); mq.push(mIdx(this) + '|volume|' + mst(this).v); });
+  def(EP, 'muted', function () { return mst(this).muted; }, function (v) { mst(this).muted = !!v; mq.push(mIdx(this) + '|muted|' + (v ? 1 : 0)); });
+  ['autoplay', 'loop', 'controls'].forEach(reflectBool);
+  reflect('poster', 'poster');
+  var _sa = EP.setAttribute;
+  EP.setAttribute = function (k, v) {
+    _sa.call(this, k, v);
+    if (String(k).toLowerCase() === 'src' && (this.localName === 'video' || this.localName === 'audio')) mq.push(mIdx(this) + '|load|' + String(v));
+  };
+
   // ---------- Hooks called from Rust ----------
   g.__runTimers = function (budget, max) {
     var end = now + budget, ran = 0;
@@ -526,6 +550,12 @@
     }
     return true;
   };
+  g.__mediaCmds = function () { var s = mq.join('\n'); mq = []; return s; };
+  g.__mediaState = function (i, paused, t, d, v, muted, ended) {
+    var el = mediaList()[i]; if (!el) return;
+    var s = mst(el); s.paused = !!paused; s.t = t; s.d = d; s.v = v; s.muted = !!muted; s.ended = !!ended;
+  };
+  g.__mediaEvent = function (i, type) { var el = mediaList()[i]; if (el) el.dispatchEvent(new Ev(type, { bubbles: false })); };
   g.__isDirty = function () { return dirty; };
   g.__serialize = function () { dirty = false; var h = document.documentElement; return h ? ser(h) : ''; };
   g.__takeNav = function () { var n = nav; nav = ''; return n; };
