@@ -4,6 +4,8 @@ use crate::dro_js::JsRuntime;
 use crate::dro_layout::{self, Layout, Paint};
 use crate::{dro_html, dro_net, dro_paint};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+mod media_bridge;
+mod bridge;
 
 pub const CRASH_MSG: &str = "Page crashed, reload?";
 const MAX_SHEETS: usize = 10;
