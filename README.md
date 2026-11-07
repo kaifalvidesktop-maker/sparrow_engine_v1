@@ -30,21 +30,22 @@
 | Item | State |
 |---|---|
 | Language / edition | Rust 2021 |
-| Code size | ~1,500 lines (target: grow toward 15k lines in phases) |
-| Compiled & tested? | **NO.** Code was written without a Rust toolchain that could resolve dependencies. First task for any contributor: run `cargo build`, fix compile errors. |
-| Rendering | CPU software rendering (tiny-skia), bitmap font |
-| JS | boa_engine interpreter, console/alert only, no DOM API |
-| Network | reqwest blocking + rustls, direct connection, no proxy |
+| Compiled & tested? | `cargo test` currently fails to compile: missing reqwest cookie feature, missing `unicode_bidi`/`unicode_linebreak` dependencies, and missing `dro_paint::decode_image`. See [phases.md](./phases.md). |
+| Rendering | CPU software rendering (tiny-skia); system-font shaping path plus bitmap fallback |
+| JS | **Boa 0.17 interpreter**, with a partial JS DOM bridge; **V8 is not implemented or wired in** |
+| Network | Blocking reqwest + rustls, RAM cookie/cache support, direct connection (no proxy) |
 | Storage | rusqlite (history, bookmarks) |
 | GPU | Not used yet (planned: vello + wgpu) |
 
-Design goal order: **(1) never crash the shell, (2) correct basic pages, (3) small binary, (4) speed.**
+**JavaScript engine status:** Sparrow itself runs JavaScript using Boa (`boa_engine` in `Cargo.toml`; `js_engine::create` accepts `boa` or `off`). There is no V8 dependency or V8 runtime adapter. `PATCHES.md` mentions Node/V8 only as a test environment for the standalone DOM bootstrap script; that does not mean Sparrow uses V8.
+
+Design goal order: **(1) never crash the shell, (2) correct and all pages, (3) small binary, (4) speed.**
 
 ---
 
 ## 2. What we have covered (implemented)
 
-Legend: ✅ done (written, not yet compiled) · 🟡 partial · ❌ not started
+Legend: ✅ implemented · 🟡 partial / integration or validation incomplete · ❌ not started
 
 ### 2.1 Pipeline
 
@@ -56,13 +57,12 @@ URL → fetch → bytes → HTML parse → DOM → CSS parse + cascade → style
 
 ### 2.2 Networking (`dro_net.rs`)
 
-- ✅ `fetch(url)` blocking GET via reqwest + rustls, 20 s timeout, `User-Agent: Sparrow/0.1`
+- ✅ Blocking HTTP requests through reqwest + rustls, `User-Agent`, redirects and request limits
 - ✅ `.no_proxy()` → direct connection only (no system proxy, no MS/Google service)
-- ✅ 20 MB body cap (`Read::take`)
-- ✅ Only `http://` and `https://` accepted
-- ✅ `resolve(base, href)` → absolute URL via the `url` crate
-- ✅ `par_map(urls, f)` → parallel downloads (8 threads at a time, `std::thread::scope`), order preserved. Used for CSS files and images.
-- ❌ Cookies, cache, HTTP/2 tuning, gzip/brotli, redirects policy customisation, POST/forms, streaming
+- ✅ Request-specific body limits, URL resolution, parallel sub-resource fetches
+- ✅ RAM cookie jar, HTTP cache/revalidation, HSTS/HTTPS-first handling, tracker and private-network sub-resource blocking
+- ✅ GET, range requests, and form POST support in the network layer
+- 🟡 Network fetch is blocking; streaming and browser-grade resource scheduling are not implemented
 
 ### 2.3 HTML parsing (`dro_html.rs`)
 
@@ -70,26 +70,28 @@ URL → fetch → bytes → HTML parse → DOM → CSS parse + cascade → style
 - ✅ Custom `TreeSink` that builds our own arena DOM directly (no intermediate rcdom, no extra crate)
 - ✅ Adjacent text merging, attributes, `add_attrs_if_missing`, `reparent_children`, `append_before_sibling`
 - 🟡 Comments/PIs stored as `Comment` nodes; doctype ignored; template contents = the template node itself
-- ❌ Streaming/incremental parsing, `document.write`, encoding sniffing (assumes UTF-8, lossy)
+- ✅ Charset-aware decoding through `dro_charset`
+- ❌ Streaming/incremental parsing and `document.write`
 
-### 2.2 DOM (`dro_dom.rs`)
+### 2.4 DOM (`dro_dom.rs`)
 
 - ✅ Arena DOM: `Vec<Node>`, `NodeId = usize`, node `0` is the Document
 - ✅ `NodeKind::{Document, Element{tag, attrs}, Text, Comment}`
 - ✅ Ops: `create`, `append_child`, `insert_before`, `detach`, `tag`, `attr`, `descendants` (iterative preorder), `text_content`, `find_tag`
-- ❌ `get_by_id` index, class list, mutation observers, events, dirty flags
+- 🟡 The JS DOM bridge supplies selectors, basic node mutation, events, and serialization; this is a JS-side compatibility layer, not a complete browser DOM
 
-### 2.4 CSS (`dro_css.rs`) — own implementation (the `stylist` crate is Yew-oriented and unsuitable)
+### 2.5 CSS (`dro_css.rs`, `dro_css_ext.rs`) — own implementation
 
 - ✅ Built-in UA stylesheet (`UA` constant): block/inline defaults, headings, lists, tables (tr = flex row), inputs, buttons, `hr`, `a`
 - ✅ Parser: comments stripped, rule lists, selector lists (`a, b`), declarations, `!important`
 - ✅ Selectors: type, `*`, `.class` (multiple), `#id`, compound (`div.a.b#x`), **descendant** (`a b`), **child** (`a > b`)
 - ✅ Specificity (id 10000 / class 100 / type 1) + source order + `!important` + inline `style=""`
 - ✅ Inheritance: `color`, `font-size`, `font-weight`, `text-decoration`, `text-align`, `line-height`
+- 🟡 Extended CSS support is implemented in `dro_css_ext.rs`; it is not a full CSS engine
 - ✅ Properties: see table in §7.3
-- ❌ Not supported: attribute selectors, pseudo-classes/elements (`:hover`, `::before`), sibling combinators, `@media`, `@font-face`, `@import`, variables (`--x`, `var()`), `calc()`, `vw/vh`, animations, transitions, grid, `position`, `float`, `z-index`, `opacity`, `border-radius`, shadows, gradients, background images
+- ❌ Major gaps remain: full pseudo-class/element and selector coverage, CSS variables, animations, grid, positioning, floats, and many visual effects
 
-### 2.5 Layout (`dro_layout.rs`) — taffy 0.4
+### 2.6 Layout (`dro_layout.rs`) — taffy 0.4
 
 - ✅ Block layout, flexbox (direction, grow, gap, justify, align-items), margins (incl. `auto` left/right), padding, border, `width` (px/%), `max-width`, `height` (px)
 - ✅ **Inline layout via word boxes:** text is split into words; each word is a fixed-size taffy leaf; consecutive inline content is wrapped in an anonymous *flex-wrap row* → gives line wrapping, `text-align` (via `justify-content`), links inline, `<br>` (zero-height 100 % wide leaf forces a break)
@@ -98,36 +100,39 @@ URL → fetch → bytes → HTML parse → DOM → CSS parse + cascade → style
 - ✅ `<li>` gets a `*` bullet word
 - ✅ Output = flat **display list** (`Vec<Item>`) in paint order with absolute coordinates + document height
 - ✅ Canvas background propagated from `<html>` / `<body>` background
-- ❌ Real text shaping, bidi, hyphenation, baseline alignment, `position`, `float`, grid, table layout algorithm, margin collapsing, `box-sizing`, overflow/scroll containers, incremental relayout
+- 🟡 Real-font shaping is implemented; bidi/line-breaking integration and layout fidelity remain incomplete
+- ❌ `position`, `float`, grid, full table layout, margin collapsing, `box-sizing`, overflow/scroll containers, incremental relayout
 
-### 2.6 Paint (`dro_paint.rs`) — tiny-skia 0.11
+### 2.7 Paint (`dro_paint.rs`) — tiny-skia 0.11
 
 - ✅ `Pixmap` canvas filled with page background
 - ✅ Solid rect fill, 4-side borders (single colour), underline
-- ✅ **Built-in 5×7 bitmap font** (ASCII 32–126), scaled by font size, bold = widened columns, unknown glyph → `?`-like cell
+- ✅ Font rendering uses `fontdb`/`rustybuzz` when available, with the built-in 5×7 bitmap font as fallback
 - ✅ Images: decode with `image` crate → premultiplied `Pixmap` → drawn with `Pattern` shader, bilinear scaling; broken-image placeholder
 - ✅ Viewport culling (items outside viewport are skipped) + vertical scroll offset
 - ✅ Output: `Vec<u8>` RGBA, `viewport_w * viewport_h * 4`
-- ❌ Real fonts, anti-aliased text, rounded corners, gradients, shadows, SVG, GPU, tiling, damage rects
+- 🟡 Real-font and anti-aliased text paths exist but need a successful build and broader validation
+- ❌ Rounded corners, gradients, shadows, SVG, GPU, tiling, damage rects
 
-### 2.7 JavaScript (`dro_js.rs`) — boa_engine 0.17
+### 2.8 JavaScript (`dro_js.rs`, `js_engine.rs`, `dro_dom_js.rs`) — Boa 0.17
 
 - ✅ One `Context` per engine instance
 - ✅ Safety limits: loop iteration limit 5,000,000; recursion limit 400 (prevents shell freeze on `while(true){}`)
 - ✅ `console.log/warn/error/info`, `alert(msg)` → captured into a thread-local log; read with `engine.take_logs()`
-- ✅ `document.title`, `document.URL`, `window` set at load
+- ✅ DOM bootstrap provides a partial document/window API, selectors, basic mutation, events, timers, storage, location, and media-element shims
 - ✅ Inline `<script>` executed in document order after styles; errors are swallowed (page still renders)
 - ✅ `eval_js(code)` returns the result converted to string
-- ❌ DOM API (`getElementById`, `querySelector`, `innerHTML`, `createElement`), events, `setTimeout`, `fetch`/XHR, `localStorage`, external `<script src>`, modules, timers/event loop
+- 🟡 DOM changes are serialized back and reparsed; API coverage and lifecycle behavior are incomplete
+- ❌ V8 adapter, external `<script src>`, modules, real `fetch`/XHR, standards-compliant event loop/microtasks
 
-### 2.8 Engine core (`sparrow_engine.rs`)
+### 2.9 Engine core (`sparrow_engine.rs`)
 
 - ✅ `SparrowEngine` struct, `new()`, `load_url`, `load_html`, `render`, `eval_js`, `take_logs`, `set_viewport`, `scroll_by`, `hit_test`, `reload`, `recover`, `is_crashed`, `url`, `title`, `viewport`
 - ✅ **Crash isolation:** every public method that can fail goes through `guard()` → `catch_unwind(AssertUnwindSafe(..))`. On panic: `crashed = true`, method returns `Err("Page crashed, reload?")`. All later calls return the same error until `recover()`/`reload()`.
 - ✅ Lazy layout: computed on first `render`/`scroll_by` after load or viewport change
 - ✅ Content-type handling: HTML, `text/*` (shown in `<pre>`), `image/*` (wrapped in `<img>`), others → `Err`
 
-### 2.9 Browser features (`src/browser/`)
+### 2.10 Browser features (`src/browser/`)
 
 - ✅ `omnibox::resolve(input)` → URL or search (DuckDuckGo; not Google/MS). Rules: scheme kept; `about:`; host-like (`has '.'`, no spaces, or `localhost`) → `https://`; else percent-encoded search.
 - ✅ `tabs::Tabs` → multiple tabs, each with its **own** `SparrowEngine` (crash in one tab does not affect others), back/forward stacks, `navigate/go_back/go_forward/open/close/switch`
@@ -136,63 +141,9 @@ URL → fetch → bytes → HTML parse → DOM → CSS parse + cascade → style
 
 ---
 
-## 3. What we will cover (roadmap)
+## 3. Roadmap
 
-Each phase should end with: compiles, `cargo clippy` clean, no `unwrap/expect`, tests added, README updated.
-
-### Phase 0 — Make it build (next step, mandatory)
-- [ ] `cargo build` and fix compile errors (boa 0.17 and html5ever 0.26 APIs were written from memory)
-- [ ] Pin transitive dependencies if the toolchain is old (see §11)
-- [ ] Smoke test: render `data` HTML string → PNG dump (add `examples/dump.rs` using the `image` crate)
-- [ ] Add `#[cfg(test)]` tests for css parser, selector matching, omnibox, dom
-
-### Phase 1 — Correctness of basic pages
-- [ ] `getElementById`-style index in DOM
-- [ ] Attribute selectors, `:first-child`, `:last-child`, `:not()`, `:hover` (needs state)
-- [ ] `@media (max-width/min-width)`, `vw/vh/vmin/vmax`, `calc()`, CSS variables
-- [ ] `position: relative/absolute/fixed`, `z-index`, `float` (basic), `overflow: hidden`, `display: none` via `visibility`
-- [ ] `box-sizing`, margin collapsing, `min-/max-height`
-- [ ] Charset sniffing (`<meta charset>`, header) with `encoding_rs`
-- [ ] gzip/brotli, cookies, redirect handling, HTTP cache (in-memory + SQLite)
-- [ ] External `<script src>`
-
-### Phase 2 — Real text
-- [ ] Replace bitmap font with real fonts: `fontdb` + `ttf-parser`/`swash` + `parley` for shaping
-- [ ] Bidi (`unicode-bidi`), line breaking (`unicode-linebreak`), grapheme clusters (`unicode-segmentation`)
-- [ ] **Bangla / Indic script support** (complex shaping through parley/swash/HarfBuzz-like) — required for Bangladeshi users
-- [ ] Font fallback chain, `@font-face` with woff2
-- [ ] Glyph cache / atlas; anti-aliased text; subpixel positioning
-
-### Phase 3 — JavaScript with DOM
-- [ ] Bind DOM to boa: `document.getElementById/querySelector(All)/createElement/appendChild/removeChild`, `innerHTML/textContent`, `setAttribute`, `classList`, `style`
-- [ ] Event loop: `setTimeout/setInterval/requestAnimationFrame`, microtasks (boa job queue)
-- [ ] Events: click, input, submit, DOMContentLoaded, load
-- [ ] `fetch`, `XMLHttpRequest`, `localStorage` (SQLite), `location`, `history`
-- [ ] Dirty flags → re-style/re-layout/re-paint after DOM mutation
-
-### Phase 4 — Interaction
-- [ ] Hit testing with real boxes (not only links), focus, text input editing, caret, selection, clipboard
-- [ ] Form submission (GET/POST), scrolling containers, mouse wheel, smooth scroll
-- [ ] Find-in-page, zoom, print-to-PDF
-
-### Phase 5 — Performance ("Chromium-like")
-- [ ] Incremental style/layout (invalidate only dirty subtrees)
-- [ ] GPU painting with `vello` + `wgpu`, tiled raster, layer compositing
-- [ ] Parallel style computation (`rayon`), off-thread parsing and networking
-- [ ] Resource scheduler (priority: HTML > CSS > fonts > images), HTTP/2 multiplexing, preconnect
-- [ ] Memory budgets, image downscale-on-decode, LRU caches
-- [ ] Benchmarks (`criterion`) and perf CI with budgets
-
-### Phase 6 — Security & process model
-- [ ] Run engine in a **separate thread with a big stack** or separate process (stack overflow cannot be caught by `catch_unwind`)
-- [ ] Same-origin policy, CORS, mixed-content blocking, CSP basics, cookie flags
-- [ ] Sandbox JS (no network except via our `fetch`), memory limits, timeouts/watchdog
-- [ ] Tracking protection / ad-block list (Brave-style, local only)
-
-### Phase 7 — Extras
-- [ ] SVG (`usvg` + `resvg`/vello), canvas 2D (subset), WebP/AVIF images
-- [ ] DevTools-lite: DOM tree dump, computed style dump, layout boxes overlay
-- [ ] Extension hooks for PuryWeb ("internet purifier")
+The implementation has advanced beyond the original checklist: charset handling, network protections, real-font shaping, media support, and a partial Boa-backed DOM bridge are present. Build validation currently fails, so integration is not yet verified. See [phases.md](./phases.md) for phase status, known blockers, and remaining work. Each phase should finish with a successful build, focused tests, and an updated README.
 
 ---
 
@@ -202,22 +153,38 @@ Each phase should end with: compiles, `cargo clippy` clean, no `unwrap/expect`, 
 sparrow_engine/
 ├── Cargo.toml
 ├── README.md
+├── phases.md
 └── src/
     ├── lib.rs                 # public API: pub fn create_engine() -> SparrowEngine
     ├── sparrow_engine.rs      # SparrowEngine: orchestrates the whole pipeline + crash guard
-    ├── dro_net.rs             # fetch, resolve, par_map
+    ├── sparrow_engine/
+    │   ├── bridge.rs          # page install, DOM bridge, timers, navigation
+    │   └── media_bridge.rs    # <audio>/<video> integration
+    ├── dro_net.rs             # requests, cache, cookies, protections
     ├── dro_html.rs            # html5ever TreeSink -> Dom
     ├── dro_dom.rs             # arena DOM
     ├── dro_css.rs             # parser, selectors, cascade, computed Style
+    ├── dro_css_ext.rs         # extended CSS support
+    ├── dro_charset.rs         # charset-aware decoding
     ├── dro_layout.rs          # DOM+Style -> taffy tree -> display list
-    ├── dro_paint.rs           # display list -> RGBA (tiny-skia), bitmap font, image decode
-    ├── dro_js.rs              # boa_engine runtime wrapper
+    ├── dro_paint.rs           # display list -> RGBA (tiny-skia)
+    ├── dro_font.rs            # font discovery and text shaping
+    ├── dro_js.rs              # Boa runtime wrapper (not V8)
+    ├── js_engine.rs           # runtime selection: boa/off
+    ├── dro_dom_js.rs          # JS/Rust DOM bridge
+    ├── dom_bootstrap.js       # partial browser DOM shim
+    ├── dro_media.rs           # audio and media decoding
+    ├── dro_media_ui.rs        # media controls
+    ├── dro_blocklist.rs       # tracker/sub-resource blocking
+    ├── ffi.rs                 # C ABI
     └── browser/
         ├── mod.rs
         ├── omnibox.rs         # input -> URL/search
         ├── tabs.rs            # tab manager (1 engine per tab)
         ├── history.rs         # SQLite
-        └── bookmark.rs        # SQLite
+        ├── bookmark.rs        # SQLite
+        ├── session.rs         # session state
+        └── settings.rs        # browser settings
 ```
 
 ### 4.1 Module dependency graph (no cycles)
@@ -275,7 +242,7 @@ browser/history, browser/bookmark ──► rusqlite only
                       Internet
 ```
 
-> The shell integration layer (Rust ↔ Go) is **not written yet**. Options: build engine as a `cdylib` with a C ABI (`extern "C"`) and call it from Go via cgo, or run it as a child process speaking a binary protocol (better crash isolation; recommended for Phase 6).
+> A C ABI (`ffi.rs`) and `cdylib` target exist. The Go shell integration is outside this repository; a separate process would provide stronger crash isolation.
 
 ### 5.2 Data flow for `load_url`
 
@@ -296,7 +263,7 @@ browser/history, browser/bookmark ──► rusqlite only
 - `block(node)` builds a taffy node for an element. Children are processed by `inline()`.
 - `inline()` accumulates a **run** (`Vec<taffy::NodeId>`) of word leaves / inline-block boxes. When a block-level child appears, `flush()` wraps the run into an anonymous `display:flex; flex-wrap:wrap` row and pushes it to the parent's child list, then the block child is added.
 - Inline elements (`span`, `a`, `b`…) do **not** create boxes; their text words are emitted into the parent's run carrying the inline element's color/size/bold/link. Consequence: inline padding/background/border are currently ignored.
-- Word width = `chars * advance(font_size)`; `advance = max(font_size*0.6, 4)`. Paint uses the same function → **layout and paint must always use `dro_paint::advance`** to stay consistent. When real fonts arrive, replace both with the shaper's measurements.
+- Word width uses the shared font measurement path when available and falls back to `advance(font_size)`; layout and paint measurements must remain consistent.
 - After `compute_layout`, `collect()` walks the taffy tree adding parent offsets and emits `Item`s in tree (= paint) order.
 
 ### 5.4 Crash-safety model
@@ -466,7 +433,7 @@ Everything else is parsed and ignored.
 ### 7.7 How to expose a new JS function
 
 - Plain function: write `fn f(this:&JsValue, args:&[JsValue], ctx:&mut Context<'_>) -> JsResult<JsValue>` and register with `ctx.register_global_builtin_callable(name, argc, NativeFunction::from_fn_ptr(f))` in `JsRuntime::new`.
-- Anything that needs engine state (DOM!) cannot use a plain fn pointer; use `NativeFunction::from_copy_closure_with_captures` with a traced capture holding an `Rc<RefCell<Dom>>`-like handle (Phase 3 design task: the DOM must become shareable between engine and JS).
+- The DOM is currently exposed through `dom_bootstrap.js` and synchronized by `dro_dom_js`/the engine bridge. Keep stateful browser operations in that bridge; the shim is partial and is not a full standards-compliant DOM.
 
 ---
 
@@ -564,16 +531,16 @@ Test ideas: CSS color parsing, selector matching (descendant/child/specificity),
 
 ## 11. Known issues and limitations
 
-1. **Never compiled.** Expect API mismatches, especially: `boa_engine` 0.17 (`register_global_builtin_callable`, `runtime_limits_mut`, `Context<'static>`), `html5ever` 0.26 `TreeSink` signatures, `taffy` 0.4 field names (`Dimension::Length`, `compute_layout`), `tiny-skia` `Pattern::new` args.
-2. **Old Cargo (1.75) cannot resolve some latest transitive crates** that require `edition2024` (seen: `icu_properties_data`, `encoding_rs 0.8.44`). Use a current stable Rust, or pin with `cargo update -p <crate> --precise <ver>` (e.g. `url 2.5.0`).
+1. **Current build does not pass.** `cargo test` reports five compile errors: `reqwest::cookie` is unavailable with the current dependency features, `unicode_bidi` and `unicode_linebreak` are undeclared dependencies, and `dro_paint::decode_image` is missing. Fix these before treating the engine as integrated.
+2. **Toolchain compatibility may still matter.** If an older Cargo cannot resolve newer transitive dependencies, use a current stable Rust or pin compatible versions.
 3. **`panic = "abort"` from the original spec was changed to `"unwind"`** because abort makes crash isolation impossible. Costs a little binary size.
 4. **`stylist`, `parley`, `vello`, `wgpu`, `winit`, `usvg` are not wired yet.** `stylist` will not be used at all.
-5. **Text:** only ASCII is drawn (bitmap font). Bangla/other scripts render as placeholder glyphs. Highest-priority functional gap.
+5. **Text:** real-font shaping exists, but unsupported scripts/font fallback and build blockers may still result in missing or placeholder glyphs.
 6. **Layout accuracy:** inline backgrounds/padding ignored; table columns don't align; `position`/`float`/grid missing; no margin collapsing.
 7. **Blocking network** on the calling thread; call from a worker thread.
 8. **Stack overflow / OOM / infinite Rust loops** cannot be caught by `catch_unwind`.
-9. **JS has no DOM**; most real websites rely on JS and will look empty or wrong.
-10. **Single global `thread_local` log** in `dro_js`: two engines on one thread share the log. Move into the runtime struct when DOM binding is added.
+9. **JavaScript is Boa, not V8.** The DOM shim is partial, `fetch` is a rejected-promise stub, and most modern websites remain unsupported.
+10. **Single global `thread_local` log** in `dro_js`: two engines on one thread share the log. Move it into the runtime instance.
 11. `serde` is declared but barely used; remove or use for IPC/settings.
 12. HTTPS-only sites with unusual TLS configs may fail (rustls strictness); no certificate UI.
 
@@ -581,18 +548,18 @@ Test ideas: CSS color parsing, selector matching (descendant/child/specificity),
 
 ## 12. Performance plan ("Chromium-like")
 
-Honest baseline: a ~1.5k-line CPU renderer will not match Chromium. Chromium's speed comes from architecture, not one trick. The plan below lists the techniques and where they land.
+Honest baseline: this CPU renderer is not Chromium. Chromium's speed comes from architecture, not one trick. The plan below lists the techniques and where they land.
 
 | Technique | Chromium analogue | Sparrow plan |
 |---|---|---|
 | Multi-process + threads | browser/renderer/GPU/network processes | engine thread/process per tab, network service, worker pool (Phase 5–6) |
 | Incremental pipeline | style/layout/paint invalidation | dirty flags on DOM nodes; re-run only affected subtrees (Phase 3/5) |
 | GPU raster | Skia/GPU, compositor | `vello` + `wgpu`, layers, tiling (Phase 5) |
-| Text perf | glyph cache, HarfBuzz | `parley`/`swash` + glyph atlas (Phase 2) |
+| Text perf | glyph cache, HarfBuzz | `rustybuzz` shaping exists; glyph caching and profiling remain |
 | Network perf | HTTP/2, preconnect, cache | reqwest H2, connection reuse (already pooled), HTTP cache, resource priorities |
 | Parsing perf | streaming parser, preload scanner | stream html5ever, early CSS/image fetch (Phase 5) |
 | Memory | discardable images, caches | LRU caches, downscale on decode, budgets |
-| JS perf | V8 JIT | boa is an interpreter → expect slow JS; long-term option: evaluate other engines (needs library-list approval) |
+| JS perf | V8 JIT | Sparrow currently uses the Boa interpreter; V8 is not wired in. A future engine swap needs dependency and integration work. |
 
 Measure first: add `criterion` benches for parse, style, layout, paint on fixed HTML fixtures; track time and peak memory per commit.
 
@@ -615,13 +582,15 @@ Measure first: add `criterion` benches for parse, style, layout, paint on fixed 
 
 ---
 
-*Owner: Kaif Alvi · Org: Codone · Project: Sparrow Browser. Keep this file current — it is the single source of truth for humans and AI assistants working on the engine.*
+*Owner: Kaif Alvi · Org: Codone · Project: Sparrow Browser. Keep this overview current; use `phases.md` for roadmap and build status.*
 
 ---
 
 ## Addendum — Phase 3 (fonts, media, tracker blocking)
 
-| Module | Purpose | Verified |
+The verification entries below are historical component-level reports, not a claim that the current full crate builds. The latest `cargo test` attempt fails during compilation; see [phases.md](./phases.md).
+
+| Module | Purpose | Earlier component check report |
 |---|---|---|
 | `dro_font.rs` | system fonts (`fontdb`) + OpenType shaping (`rustybuzz`) + AA outline rendering (tiny-skia); Bangla/Indic conjuncts, ligatures, per-char font fallback | compiled, 2 tests, rendered PNG checked visually |
 | `dro_media.rs` | pure-Rust audio player: `symphonia` decode, linear resampler, `cpal` output, audio-clock master, seek/volume/mute; animated GIF video; MP4 probe | compiled, 4 tests |

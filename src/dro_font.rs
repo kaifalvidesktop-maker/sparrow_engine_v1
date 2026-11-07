@@ -78,9 +78,9 @@ fn make_face(data: Vec<u8>, index: u32, weight: u16, italic: bool) -> Option<Fac
 }
 
 struct GlyphMask { w: u32, h: u32, left: i32, top: i32, a: Vec<u8> }
-#[derive(Clone, PartialEq, Eq, Hash)] struct MaskKey { face: usize, gid: u16, size_q: u32, sub: u8, skew: bool }
+#[derive(Clone, PartialEq, Eq, Hash)] struct MaskKey { face: usize, gid: u16, size_bits: u32, sub: u8, skew: bool }
 #[derive(Clone, PartialEq, Eq, Hash)] struct ChainKey { fam: String, w: u16, italic: bool }
-#[derive(Clone, PartialEq, Eq, Hash)] struct ShapeKey { text: String, size_q: u32, w: u16, italic: bool, fam: String, ls: i32 }
+#[derive(Clone, PartialEq, Eq, Hash)] struct ShapeKey { text: String, size_bits: u32, w: u16, italic: bool, fam: String, ls: i32 }
 #[derive(Clone, Copy)] struct WebFace { id: fontdb::ID, weight: u16, italic: bool }
 
 struct Pb(PathBuilder);
@@ -270,7 +270,7 @@ impl Fonts {
 
     pub fn shape_style(&mut self, text: &str, st: &TextStyle) -> Shaped {
         let cacheable = text.len() <= 512;
-        let key = ShapeKey { text: if cacheable { text.to_string() } else { String::new() }, size_q: (st.size * 4.0) as u32, w: st.weight, italic: st.italic, fam: st.families.join(","), ls: (st.letter_spacing * 100.0) as i32 };
+        let key = ShapeKey { text: if cacheable { text.to_string() } else { String::new() }, size_bits: st.size.to_bits(), w: st.weight, italic: st.italic, fam: st.families.join(","), ls: (st.letter_spacing * 100.0) as i32 };
         if cacheable { if let Some(s) = self.shaped.get(&key) { return s.clone(); } }
         let chain = self.chain_for(st);
         let mut out = Shaped { glyphs: vec![], width: 0.0, size: st.size, weight: st.weight, italic: st.italic };
@@ -449,7 +449,7 @@ impl Fonts {
                 }
                 let ix = gx.floor();
                 let sub = (((gx - ix) * SUBPIXEL as f32) as u8).min(SUBPIXEL - 1);
-                let key = MaskKey { face: g.face, gid: g.id, size_q: (s.size * 4.0) as u32, sub, skew };
+                let key = MaskKey { face: g.face, gid: g.id, size_bits: s.size.to_bits(), sub, skew };
                 if let Some(m) = self.mask(key, sc, sub as f32 / SUBPIXEL as f32) { blit(pm, &m, ix as i32, gy.round() as i32, rgb); }
             }
         }
@@ -597,6 +597,14 @@ mod tests {
         let b = f.measure_style("Spacing", &TextStyle::new(20.0).spacing(3.0));
         assert!(b > a + 10.0, "{a} {b}");
         assert_eq!(f.measure_style("Spacing", &TextStyle::new(20.0)), a);
+    }
+    #[test] fn shape_cache_does_not_alias_nearby_font_sizes() {
+        let mut f = Fonts::new();
+        if !f.has_fonts() { return; }
+        let first = f.shape("cache size", 16.0, false);
+        let second = f.shape("cache size", 16.1, false);
+        assert_eq!(first.size, 16.0);
+        assert_eq!(second.size, 16.1);
     }
     #[test] fn renders_pixels() {
         let mut f = Fonts::new();

@@ -1,7 +1,8 @@
-# Phase 3 patches (fonts + media + tracker blocking). Apply on top of Phase 1-2 code.
+# Phase 3 implementation notes (fonts + media + tracker blocking)
 
-New files (copy as-is): src/dro_font.rs, dro_media.rs, dro_media_ui.rs, dro_blocklist.rs,
-src/sparrow_engine/media_bridge.rs, and the UPDATED src/dom_bootstrap.js (adds HTMLMediaElement API).
+The modules and integrations described below are already present in this repository; these are historical implementation notes, not instructions to apply the patch a second time. Verify current source before relying on snippets or verification claims. The current full-crate build is blocked; see `phases.md`.
+
+Files covered by these notes include `src/dro_font.rs`, `src/dro_media.rs`, `src/dro_media_ui.rs`, `src/dro_blocklist.rs`, `src/sparrow_engine/media_bridge.rs`, and `src/dom_bootstrap.js` (which includes the `HTMLMediaElement` shim).
 
 ## Cargo.toml
 ```toml
