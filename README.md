@@ -1,633 +1,1494 @@
 # Sparrow Engine
 
-> Rust browser engine embedded inside the **Sparrow** desktop browser shell (Go + WebView shell by Kaif Alvi / Codone).
-> The shell calls the engine; the engine returns pixels. **The engine must never crash the shell.**
+> A Rust browser engine embedded in the **Sparrow** desktop shell (Go + WebView). The shell hands the engine a URL; the engine returns RGBA pixels. **The engine must never crash the shell.**
 
-**বাংলা সারসংক্ষেপ:** এটা Sparrow browser-এর ভেতরের Rust engine। Shell এটাকে URL দেয়, engine HTML/CSS/JS প্রসেস করে RGBA pixel ফেরত দেয়। Engine panic করলেও shell বেঁচে থাকে এবং "Page crashed, reload?" দেখায়। এই README অন্য AI/developer-কে পুরো প্রজেক্ট বোঝানোর জন্য ইংরেজিতে লেখা।
+**বাংলা সারসংক্ষেপ:** এটি Sparrow ব্রাউজারের ভেতরের Rust ইঞ্জিন। শেল URL দেয়, ইঞ্জিন HTML/CSS/JS প্রসেস করে RGBA পিক্সেল ফেরত দেয়। ইঞ্জিন প্যানিক করলেও শেল বেঁচে থাকে এবং "Page crashed, reload?" দেখায়। সব ডেটা RAM-এ থাকে; ডিস্কে শুধু বুকমার্ক ও সেটিংস (ফেজ-৪ ডিজাইন)।
+
+> This README is generated from the source tree (module docs, public API, tests). Hand-written parts: status, architecture, integration, roadmap.
 
 ---
 
 ## Table of contents
 
-1. [Status at a glance](#1-status-at-a-glance)
-2. [What we have covered (implemented)](#2-what-we-have-covered-implemented)
-3. [What we will cover (roadmap)](#3-what-we-will-cover-roadmap)
-4. [Code structure](#4-code-structure)
-5. [System design](#5-system-design)
-6. [Packages (25+) for building this engine](#6-packages-25-for-building-this-engine)
-7. [Feature reference for AI assistants](#7-feature-reference-for-ai-assistants)
-8. [Public API contract](#8-public-api-contract)
-9. [Engineering rules (MUST follow)](#9-engineering-rules-must-follow)
-10. [Build, run, test](#10-build-run-test)
-11. [Known issues and limitations](#11-known-issues-and-limitations)
-12. [Performance plan ("Chromium-like")](#12-performance-plan-chromium-like)
-13. [Glossary](#13-glossary)
+1. [Status](#status)
+2. [Design goals](#design-goals)
+3. [Architecture](#architecture)
+4. [Repository layout](#repository-layout)
+5. [Pipeline walkthrough](#pipeline-walkthrough)
+6. [Module reference](#module-reference)
+7. [C ABI reference](#c-abi-reference)
+8. [Shell integration (Go/cgo)](#shell-integration-gocgo)
+9. [Phase 4 integration guide](#phase-4-integration-guide)
+10. [Storage and privacy model](#storage-and-privacy-model)
+11. [Threading and crash model](#threading-and-crash-model)
+12. [Security model](#security-model)
+13. [Testing](#testing)
+14. [Build blockers](#build-blockers)
+15. [Not covered yet](#not-covered-yet)
+16. [Roadmap](#roadmap)
+17. [Engineering rules](#engineering-rules)
+18. [Glossary](#glossary)
 
 ---
 
-## 1. Status at a glance
+## Status
 
 | Item | State |
 |---|---|
-| Language / edition | Rust 2021 |
-| Code size | ~1,500 lines (target: grow toward 50k lines in phases) |
-| Compiled & tested? | **NO.** Code was written without a Rust toolchain that could resolve dependencies. First task for any contributor: run `cargo build`, fix compile errors. |
-| Rendering | CPU software rendering (tiny-skia), bitmap font |
-| JS | boa_engine interpreter, console/alert only, no DOM API |
-| Network | reqwest blocking + rustls, direct connection, no proxy |
-| Storage | rusqlite (history, bookmarks) |
-| GPU | Not used yet (planned: vello + wgpu) |
+| Language | Rust 2021 (`rlib` + `cdylib`) |
+| Compiled and tested | **No.** Nothing in this tree has been built by the author of this README. Run `cargo build` first. |
+| Rendering | CPU software (tiny-skia); system fonts via fontdb + rustybuzz; bitmap fallback |
+| JavaScript | Boa 0.17 (interpreter). V8 is not used. `fetch`/XHR are stubs |
+| Network | reqwest (blocking, rustls), RAM cookie jar, RAM cache, HSTS, https-first |
+| Storage | Phase 4: plain-text file for bookmarks + settings only; history/session/cache RAM-only |
+| Phase 4 modules | Files exist but are **not declared in `lib.rs`** yet (see [Phase 4 integration guide](#phase-4-integration-guide)) |
+| GPU | Not used |
 
-Design goal order: **(1) never crash the shell, (2) correct and all pages, (3) small binary, (4) speed.**
+Legend used below: **done** = code present, **partial** = present but not wired or incomplete, **missing** = not in tree.
 
----
-
-## 2. What we have covered (implemented)
-
-Legend: ✅ done (written, not yet compiled) · 🟡 partial · ❌ not started
-
-### 2.1 Pipeline
-
-```
-URL → fetch → bytes → HTML parse → DOM → CSS parse + cascade → styled DOM
-    → layout (taffy) → display list → paint (tiny-skia) → RGBA framebuffer → shell
-                                   ↘ JS (boa) runs inline <script> after style
-```
-
-### 2.2 Networking (`dro_net.rs`)
-
-- ✅ `fetch(url)` blocking GET via reqwest + rustls, 20 s timeout, `User-Agent: Sparrow/0.1`
-- ✅ `.no_proxy()` → direct connection only (no system proxy, no MS/Google service)
-- ✅ 20 MB body cap (`Read::take`)
-- ✅ Only `http://` and `https://` accepted
-- ✅ `resolve(base, href)` → absolute URL via the `url` crate
-- ✅ `par_map(urls, f)` → parallel downloads (8 threads at a time, `std::thread::scope`), order preserved. Used for CSS files and images.
-- ❌ Cookies, cache, HTTP/2 tuning, gzip/brotli, redirects policy customisation, POST/forms, streaming
-
-### 2.3 HTML parsing (`dro_html.rs`)
-
-- ✅ Full HTML5 spec-compliant parsing through `html5ever` (error recovery, implied tags, tables, foster parenting)
-- ✅ Custom `TreeSink` that builds our own arena DOM directly (no intermediate rcdom, no extra crate)
-- ✅ Adjacent text merging, attributes, `add_attrs_if_missing`, `reparent_children`, `append_before_sibling`
-- 🟡 Comments/PIs stored as `Comment` nodes; doctype ignored; template contents = the template node itself
-- ❌ Streaming/incremental parsing, `document.write`, encoding sniffing (assumes UTF-8, lossy)
-
-### 2.2 DOM (`dro_dom.rs`)
-
-- ✅ Arena DOM: `Vec<Node>`, `NodeId = usize`, node `0` is the Document
-- ✅ `NodeKind::{Document, Element{tag, attrs}, Text, Comment}`
-- ✅ Ops: `create`, `append_child`, `insert_before`, `detach`, `tag`, `attr`, `descendants` (iterative preorder), `text_content`, `find_tag`
-- ❌ `get_by_id` index, class list, mutation observers, events, dirty flags
-
-### 2.4 CSS (`dro_css.rs`) — own implementation (the `stylist` crate is Yew-oriented and unsuitable)
-
-- ✅ Built-in UA stylesheet (`UA` constant): block/inline defaults, headings, lists, tables (tr = flex row), inputs, buttons, `hr`, `a`
-- ✅ Parser: comments stripped, rule lists, selector lists (`a, b`), declarations, `!important`
-- ✅ Selectors: type, `*`, `.class` (multiple), `#id`, compound (`div.a.b#x`), **descendant** (`a b`), **child** (`a > b`)
-- ✅ Specificity (id 10000 / class 100 / type 1) + source order + `!important` + inline `style=""`
-- ✅ Inheritance: `color`, `font-size`, `font-weight`, `text-decoration`, `text-align`, `line-height`
-- ✅ Properties: see table in §7.3
-- ❌ Not supported: attribute selectors, pseudo-classes/elements (`:hover`, `::before`), sibling combinators, `@media`, `@font-face`, `@import`, variables (`--x`, `var()`), `calc()`, `vw/vh`, animations, transitions, grid, `position`, `float`, `z-index`, `opacity`, `border-radius`, shadows, gradients, background images
-
-### 2.5 Layout (`dro_layout.rs`) — taffy 0.4
-
-- ✅ Block layout, flexbox (direction, grow, gap, justify, align-items), margins (incl. `auto` left/right), padding, border, `width` (px/%), `max-width`, `height` (px)
-- ✅ **Inline layout via word boxes:** text is split into words; each word is a fixed-size taffy leaf; consecutive inline content is wrapped in an anonymous *flex-wrap row* → gives line wrapping, `text-align` (via `justify-content`), links inline, `<br>` (zero-height 100 % wide leaf forces a break)
-- ✅ `<img>`: intrinsic size from decoded image, `width`/`height` attributes or CSS, aspect-ratio preserved, `max-width: 100%`
-- ✅ `<input>` text (180 px default width, placeholder shown), password (`*`), checkbox/radio (13 px box), submit/button (value as label)
-- ✅ `<li>` gets a `*` bullet word
-- ✅ Output = flat **display list** (`Vec<Item>`) in paint order with absolute coordinates + document height
-- ✅ Canvas background propagated from `<html>` / `<body>` background
-- ❌ Real text shaping, bidi, hyphenation, baseline alignment, `position`, `float`, grid, table layout algorithm, margin collapsing, `box-sizing`, overflow/scroll containers, incremental relayout
-
-### 2.6 Paint (`dro_paint.rs`) — tiny-skia 0.11
-
-- ✅ `Pixmap` canvas filled with page background
-- ✅ Solid rect fill, 4-side borders (single colour), underline
-- ✅ **Built-in 5×7 bitmap font** (ASCII 32–126), scaled by font size, bold = widened columns, unknown glyph → `?`-like cell
-- ✅ Images: decode with `image` crate → premultiplied `Pixmap` → drawn with `Pattern` shader, bilinear scaling; broken-image placeholder
-- ✅ Viewport culling (items outside viewport are skipped) + vertical scroll offset
-- ✅ Output: `Vec<u8>` RGBA, `viewport_w * viewport_h * 4`
-- ❌ Real fonts, anti-aliased text, rounded corners, gradients, shadows, SVG, GPU, tiling, damage rects
-
-### 2.7 JavaScript (`dro_js.rs`) — boa_engine 0.17
-
-- ✅ One `Context` per engine instance
-- ✅ Safety limits: loop iteration limit 5,000,000; recursion limit 400 (prevents shell freeze on `while(true){}`)
-- ✅ `console.log/warn/error/info`, `alert(msg)` → captured into a thread-local log; read with `engine.take_logs()`
-- ✅ `document.title`, `document.URL`, `window` set at load
-- ✅ Inline `<script>` executed in document order after styles; errors are swallowed (page still renders)
-- ✅ `eval_js(code)` returns the result converted to string
-- ❌ DOM API (`getElementById`, `querySelector`, `innerHTML`, `createElement`), events, `setTimeout`, `fetch`/XHR, `localStorage`, external `<script src>`, modules, timers/event loop
-
-### 2.8 Engine core (`sparrow_engine.rs`)
-
-- ✅ `SparrowEngine` struct, `new()`, `load_url`, `load_html`, `render`, `eval_js`, `take_logs`, `set_viewport`, `scroll_by`, `hit_test`, `reload`, `recover`, `is_crashed`, `url`, `title`, `viewport`
-- ✅ **Crash isolation:** every public method that can fail goes through `guard()` → `catch_unwind(AssertUnwindSafe(..))`. On panic: `crashed = true`, method returns `Err("Page crashed, reload?")`. All later calls return the same error until `recover()`/`reload()`.
-- ✅ Lazy layout: computed on first `render`/`scroll_by` after load or viewport change
-- ✅ Content-type handling: HTML, `text/*` (shown in `<pre>`), `image/*` (wrapped in `<img>`), others → `Err`
-
-### 2.9 Browser features (`src/browser/`)
-
-- ✅ `omnibox::resolve(input)` → URL or search (DuckDuckGo; not Google/MS). Rules: scheme kept; `about:`; host-like (`has '.'`, no spaces, or `localhost`) → `https://`; else percent-encoded search.
-- ✅ `tabs::Tabs` → multiple tabs, each with its **own** `SparrowEngine` (crash in one tab does not affect others), back/forward stacks, `navigate/go_back/go_forward/open/close/switch`
-- ✅ `history::History` (SQLite): `add` (upsert + visit count), `search`, `clear`
-- ✅ `bookmark::Bookmarks` (SQLite): `add`, `remove`, `contains`, `list`
-
----
-
-## 3. What we will cover (roadmap)
-
-Each phase should end with: compiles, `cargo clippy` clean, no `unwrap/expect`, tests added, README updated.
-
-### Phase 0 — Make it build (next step, mandatory)
-- [ ] `cargo build` and fix compile errors (boa 0.17 and html5ever 0.26 APIs were written from memory)
-- [ ] Pin transitive dependencies if the toolchain is old (see §11)
-- [ ] Smoke test: render `data` HTML string → PNG dump (add `examples/dump.rs` using the `image` crate)
-- [ ] Add `#[cfg(test)]` tests for css parser, selector matching, omnibox, dom
-
-### Phase 1 — Correctness of basic pages
-- [ ] `getElementById`-style index in DOM
-- [ ] Attribute selectors, `:first-child`, `:last-child`, `:not()`, `:hover` (needs state)
-- [ ] `@media (max-width/min-width)`, `vw/vh/vmin/vmax`, `calc()`, CSS variables
-- [ ] `position: relative/absolute/fixed`, `z-index`, `float` (basic), `overflow: hidden`, `display: none` via `visibility`
-- [ ] `box-sizing`, margin collapsing, `min-/max-height`
-- [ ] Charset sniffing (`<meta charset>`, header) with `encoding_rs`
-- [ ] gzip/brotli, cookies, redirect handling, HTTP cache (in-memory + SQLite)
-- [ ] External `<script src>`
-
-### Phase 2 — Real text
-- [ ] Replace bitmap font with real fonts: `fontdb` + `ttf-parser`/`swash` + `parley` for shaping
-- [ ] Bidi (`unicode-bidi`), line breaking (`unicode-linebreak`), grapheme clusters (`unicode-segmentation`)
-- [ ] **Bangla / Indic script support** (complex shaping through parley/swash/HarfBuzz-like) — required for Bangladeshi users
-- [ ] Font fallback chain, `@font-face` with woff2
-- [ ] Glyph cache / atlas; anti-aliased text; subpixel positioning
-
-### Phase 3 — JavaScript with DOM
-- [ ] Bind DOM to boa: `document.getElementById/querySelector(All)/createElement/appendChild/removeChild`, `innerHTML/textContent`, `setAttribute`, `classList`, `style`
-- [ ] Event loop: `setTimeout/setInterval/requestAnimationFrame`, microtasks (boa job queue)
-- [ ] Events: click, input, submit, DOMContentLoaded, load
-- [ ] `fetch`, `XMLHttpRequest`, `localStorage` (SQLite), `location`, `history`
-- [ ] Dirty flags → re-style/re-layout/re-paint after DOM mutation
-
-### Phase 4 — Interaction
-- [ ] Hit testing with real boxes (not only links), focus, text input editing, caret, selection, clipboard
-- [ ] Form submission (GET/POST), scrolling containers, mouse wheel, smooth scroll
-- [ ] Find-in-page, zoom, print-to-PDF
-
-### Phase 5 — Performance ("Chromium-like")
-- [ ] Incremental style/layout (invalidate only dirty subtrees)
-- [ ] GPU painting with `vello` + `wgpu`, tiled raster, layer compositing
-- [ ] Parallel style computation (`rayon`), off-thread parsing and networking
-- [ ] Resource scheduler (priority: HTML > CSS > fonts > images), HTTP/2 multiplexing, preconnect
-- [ ] Memory budgets, image downscale-on-decode, LRU caches
-- [ ] Benchmarks (`criterion`) and perf CI with budgets
-
-### Phase 6 — Security & process model
-- [ ] Run engine in a **separate thread with a big stack** or separate process (stack overflow cannot be caught by `catch_unwind`)
-- [ ] Same-origin policy, CORS, mixed-content blocking, CSP basics, cookie flags
-- [ ] Sandbox JS (no network except via our `fetch`), memory limits, timeouts/watchdog
-- [ ] Tracking protection / ad-block list (Brave-style, local only)
-
-### Phase 7 — Extras
-- [ ] SVG (`usvg` + `resvg`/vello), canvas 2D (subset), WebP/AVIF images
-- [ ] DevTools-lite: DOM tree dump, computed style dump, layout boxes overlay
-- [ ] Extension hooks for PuryWeb ("internet purifier")
-
----
-
-## 4. Code structure
-
-```
-sparrow_engine/
-├── Cargo.toml
-├── README.md
-└── src/
-    ├── lib.rs                 # public API: pub fn create_engine() -> SparrowEngine
-    ├── sparrow_engine.rs      # SparrowEngine: orchestrates the whole pipeline + crash guard
-    ├── dro_net.rs             # fetch, resolve, par_map
-    ├── dro_html.rs            # html5ever TreeSink -> Dom
-    ├── dro_dom.rs             # arena DOM
-    ├── dro_css.rs             # parser, selectors, cascade, computed Style
-    ├── dro_layout.rs          # DOM+Style -> taffy tree -> display list
-    ├── dro_paint.rs           # display list -> RGBA (tiny-skia), bitmap font, image decode
-    ├── dro_js.rs              # boa_engine runtime wrapper
-    └── browser/
-        ├── mod.rs
-        ├── omnibox.rs         # input -> URL/search
-        ├── tabs.rs            # tab manager (1 engine per tab)
-        ├── history.rs         # SQLite
-        └── bookmark.rs        # SQLite
-```
-
-### 4.1 Module dependency graph (no cycles)
-
-```
-lib.rs ──► sparrow_engine ──► dro_html ──► dro_dom
-                │            ├► dro_css  ──► dro_dom
-                │            ├► dro_layout ─► dro_dom, dro_css, dro_net(resolve), dro_paint(advance)
-                │            ├► dro_paint ──► dro_css(Color), dro_layout(Layout, Paint)
-                │            ├► dro_js
-                │            └► dro_net
-browser/tabs ──► sparrow_engine, browser/omnibox
-browser/history, browser/bookmark ──► rusqlite only
-```
-
-### 4.2 Key types (cheat sheet)
-
-| Type | File | Meaning |
+| Area | State | Notes |
 |---|---|---|
-| `Dom`, `Node`, `NodeId`, `NodeKind` | dro_dom | arena tree; `nodes[0]` = Document |
-| `Rule`, `Style`, `Color(r,g,b)`, `Display`, `Len`, `Align` | dro_css | parsed rules and computed style (`Vec<Option<Style>>` indexed by `NodeId`) |
-| `Layout { items, height, bg }` | dro_layout | result of layout |
-| `Item { x, y, w, h, paint }` | dro_layout | one drawable in absolute document coordinates |
-| `Paint::{Box, Word, Image}` | dro_layout | what to draw |
-| `Response { url, status, content_type, body }` | dro_net | HTTP result (final URL after redirects) |
-| `JsRuntime` | dro_js | wraps `boa_engine::Context` |
-| `SparrowEngine` | sparrow_engine | the object the shell owns |
-| `Tabs`, `Tab` | browser/tabs | tab manager |
-
-### 4.3 Naming conventions
-
-- Engine files are prefixed `dro_` (historical name "Dro"). Browser-level files live in `browser/`.
-- Error type everywhere: `Result<T, String>`.
-- Colors are `Color(u8,u8,u8)` (alpha not yet supported).
-- Coordinates are `f32` CSS pixels (no device-pixel-ratio yet).
-
----
-
-## 5. System design
-
-### 5.1 Context diagram
-
-```
-┌─────────────────────────── Sparrow Shell (Go + WebView, Win32/MinGW) ───────────────────────────┐
-│  window, address bar UI, tab strip UI, menus, event loop                                         │
-│        │ calls (FFI/binding)                                       ▲ RGBA pixels, strings        │
-│        ▼                                                           │                             │
-│  ┌──────────────────────── Sparrow Engine (Rust, this repo) ───────┴───────────────┐             │
-│  │  Tabs ─► SparrowEngine ─► net/html/css/layout/paint/js                          │             │
-│  │  History / Bookmarks (SQLite file)                                              │             │
-│  └─────────────────────────────────────────────────────────────────────────────────┘             │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
-                         │ direct TCP+TLS (rustls), no proxy, no Google/MS endpoints
-                         ▼
-                      Internet
-```
-
-> The shell integration layer (Rust ↔ Go) is **not written yet**. Options: build engine as a `cdylib` with a C ABI (`extern "C"`) and call it from Go via cgo, or run it as a child process speaking a binary protocol (better crash isolation; recommended for Phase 6).
-
-### 5.2 Data flow for `load_url`
-
-1. `guard()` checks `crashed`; wraps the rest in `catch_unwind`.
-2. `dro_net::fetch` → `Response`.
-3. Content-type switch → HTML string.
-4. `dro_html::parse` → `Dom`.
-5. Walk DOM once collecting: `<style>` text, `<link rel=stylesheet>` URLs, `<img src>` URLs, inline `<script>` code, `<title>`.
-6. `par_map` downloads CSS + images in parallel; images decoded to premultiplied `Pixmap`.
-7. `dro_css::parse(UA)` + author rules in document order → `compute()` → `Vec<Option<Style>>`.
-8. New `JsRuntime`; set `document.title/URL`; run scripts (errors ignored).
-9. Layout is **lazy**: invalidated (`layout = None`).
-
-`render()`: `ensure_layout()` → `dro_layout::compute(...)` → `dro_paint::paint(...)` → RGBA bytes.
-
-### 5.3 Layout algorithm (important for anyone touching `dro_layout.rs`)
-
-- `block(node)` builds a taffy node for an element. Children are processed by `inline()`.
-- `inline()` accumulates a **run** (`Vec<taffy::NodeId>`) of word leaves / inline-block boxes. When a block-level child appears, `flush()` wraps the run into an anonymous `display:flex; flex-wrap:wrap` row and pushes it to the parent's child list, then the block child is added.
-- Inline elements (`span`, `a`, `b`…) do **not** create boxes; their text words are emitted into the parent's run carrying the inline element's color/size/bold/link. Consequence: inline padding/background/border are currently ignored.
-- Word width = `chars * advance(font_size)`; `advance = max(font_size*0.6, 4)`. Paint uses the same function → **layout and paint must always use `dro_paint::advance`** to stay consistent. When real fonts arrive, replace both with the shaper's measurements.
-- After `compute_layout`, `collect()` walks the taffy tree adding parent offsets and emits `Item`s in tree (= paint) order.
-
-### 5.4 Crash-safety model
-
-| Failure | Handled? | How |
-|---|---|---|
-| Rust panic (index OOB, arithmetic, etc.) | ✅ | `guard()` → `Err("Page crashed, reload?")`; shell shows button; `recover()`/`reload()` resets |
-| Error (network, parse, alloc) | ✅ | `Result<T, String>` |
-| JS exception | ✅ | returned as `Err("JS error: …")` / swallowed for page scripts |
-| JS infinite loop / deep recursion | ✅ | boa runtime limits |
-| Stack overflow (deep recursion in Rust) | ❌ | **cannot** be caught; mitigated by depth caps (256/200) in css/layout; real fix = run engine on a thread with a large stack or in a child process |
-| Out-of-memory abort | ❌ | caps on body (20 MB), image pixels (16 MP), image count (40); real fix = process isolation |
-| Infinite loop in Rust code | ❌ | no watchdog yet (Phase 6) |
-
-Tabs are isolated from each other because every tab owns its engine; a crashed tab is recoverable without touching the others (as long as the panic did not corrupt global state — there is only a `thread_local` log and a `OnceLock` HTTP client).
-
-### 5.4.1 Threading
-
-- Engine objects are **not `Send`-safe by design** (boa `Context` is `!Send`). Keep each `SparrowEngine` on one thread.
-- `dro_net::fetch` is **blocking**. The shell must call `load_url` from a worker thread, never the UI thread. (Phase 5: async fetch + message passing.)
-- `par_map` uses scoped threads internally for CSS/image downloads.
-
-### 5.5 Target architecture (Phase 5–6)
-
-```
-UI thread (shell)            Engine thread/process                  Worker pool (rayon)
-  input events ──────────►   task queue ──► Parser ──► Style ─────► parallel style / decode images
-  ◄── frames (RGBA/GPU) ───  Layout ──► Display list ──► Raster/Compositor (vello+wgpu)
-                             JS thread (boa) ◄──► DOM bindings ──► dirty flags ──► re-style/layout/paint
-                             Network service (async reqwest, cache, cookies) 
-```
-
-### 5.6 Storage
-
-SQLite file(s) chosen by the shell (`History::open(path)`, `Bookmarks::open(path)`).
-
-```sql
-history(url TEXT PRIMARY KEY, title TEXT, visits INTEGER DEFAULT 1, last INTEGER)
-bookmarks(id INTEGER PRIMARY KEY, url TEXT UNIQUE, title TEXT)
-```
-
-### 5.7 Design principles
-
-1. **No vendor lock-in / no vendored code:** dependencies come from crates.io only; no copied/forked third-party source in the repo. (Note: `rusqlite`'s `bundled` feature compiles SQLite's C source that ships inside the crate.) No Google/Microsoft services; default search engine is DuckDuckGo.
-2. **Small binary:** `default-features = false` wherever possible; `opt-level="z"`, `lto`, `strip`, `codegen-units=1`.
-3. **Own the core:** CSS and layout glue are ours; heavy lifting delegated to focused crates.
-4. **Fail soft:** a broken stylesheet/script/image never prevents the page from rendering.
+| HTML parse + DOM arena | done | html5ever, arena `Dom` |
+| CSS cascade + extensions | done | `dro_css`, `dro_css_ext` |
+| Layout | done | taffy; images, media boxes, `Paint::Image` |
+| Paint | done | tiny-skia; bilinear image scaling |
+| Text shaping (Bangla/Indic) | partial | needs `unicode-bidi`, `unicode-linebreak` deps |
+| JS runtime | partial | Boa; partial DOM shim; no fetch/XHR |
+| Media | partial | audio + GIF; no video frame decode |
+| Networking | done | cookies, cache, redirects, blocklist |
+| Forms (`forms.rs`) | partial | logic done; not called from engine |
+| Text input (`input.rs`) | partial | model done; no focus/key wiring |
+| HTTP cache (`dro_cache.rs`) | partial | not used by `dro_net` |
+| Engine thread (`engine_host.rs`) | partial | not declared in `lib.rs`; ffi/tabs not switched |
+| Process isolation | missing | planned `process_host.rs` |
+| Same-origin / CORS / CSP | missing | planned `origin.rs` |
+| Incremental layout/paint | missing | planned `invalidate.rs`, `raster_cache.rs` |
+| Scheduler | missing | planned `scheduler.rs` |
 
 ---
 
-## 6. Packages (25+) for building this engine
+## Design goals
 
-Status: **USED** = in `Cargo.toml` now · **PLAN** = planned, within the original 15-library list · **PROPOSE** = outside the original 15, needs owner approval before adding (the owner restricted the engine to a fixed library list).
+Order of priority:
 
-| # | Crate | Purpose in Sparrow | Status |
+1. Never crash the shell.
+2. Correct rendering of real pages.
+3. Small binary.
+4. Speed.
+
+- One engine owns one page: DOM, styles, layout, JS context, media slots.
+- Every public method is panic-guarded; a panic marks the engine crashed and returns `"Page crashed, reload?"`.
+- Everything except bookmarks and settings lives in RAM and disappears with the process.
+- Strings returned over the C ABI are owned by the handle and valid until the next call.
+- No telemetry, no third-party trackers: sub-resources run through a blocklist.
+
+---
+
+## Architecture
+
+```text
+Go shell (WebView)
+   |  cgo / C ABI  (include/sparrow.h)
+   v
+ffi.rs  -- Handle { engine, frame, err, text }
+   |
+   v
+engine_host.rs  RemoteEngine -> EngineHost thread (256 MB stack, catch_unwind)
+   |   Cmd / Reply  (binary codec, ready for a child process)
+   v
+sparrow_engine.rs  SparrowEngine (guard(), recover())
+   |-- bridge.rs        install_page, JS<->DOM, events, timers, find, page_text
+   |-- media_bridge.rs  <audio>/<video> slots, tick, click, key
+   |
+   |  fetch --> dro_net  (cookies, cache, HSTS, blocklist, redirects)
+   |  decode -> dro_charset
+   |  parse --> dro_html (html5ever) -> dro_dom (arena)
+   |  style --> dro_css + dro_css_ext
+   |  layout -> dro_layout (taffy) + dro_font (rustybuzz)
+   |  paint --> dro_paint (tiny-skia) + dro_media_ui overlay
+   |  script -> js_engine -> dro_js (Boa) + dom_bootstrap.js + dro_dom_js
+   v
+RGBA frame (viewport w * h * 4)
+```
+
+### Data flow of one navigation
+
+1. `load_url` trims input; `same_doc` checks for a fragment-only jump.
+2. `fetch_page` calls `dro_net::fetch`, decides the MIME type (declared, else sniffed).
+3. HTML is decoded with `dro_charset::decode`; text and JSON are wrapped in `<pre>`; images in `<img>`.
+4. `install` sets the page URL for the net layer and calls `bridge::install_page`.
+5. `install_page` parses HTML, collects CSS/image/script URLs, fetches them in parallel (`par_map`), builds styles.
+6. Scripts run in order; DOM changes made by JS are applied back (`apply_js`).
+7. `setup_media` creates a slot per `<audio>`/`<video>`.
+8. `render` computes layout if missing, paints, overlays media controls, returns RGBA.
+
+---
+
+## Repository layout
+
+| Path | Lines | Role |
+|---|---:|---|
+| `CHANGES.md` | 32 |  |
+| `Cargo.toml` | 31 |  |
+| `PATCHES.md` | 67 |  |
+| `PATCHES_P3.md` | 89 |  |
+| `PATCHES_P4.md` | 35 |  |
+| `README.md` | 633 |  |
+| `check.bat` | 9 |  |
+| `check.sh` | 5 |  |
+| `docs/shell_integration.md` | 69 |  |
+| `include/sparrow.h` | 39 |  |
+| `phases.md` | 96 |  |
+| `prompt_for_html.txt` | 41 |  |
+| `src/browser/bookmark.rs` | 30 |  |
+| `src/browser/history.rs` | 73 | History is RAM-only by design: nothing is written to disk, everything is gone on exit. |
+| `src/browser/mod.rs` | 6 |  |
+| `src/browser/omnibox.rs` | 14 |  |
+| `src/browser/session.rs` | 51 |  |
+| `src/browser/settings.rs` | 34 |  |
+| `src/browser/store.rs` | 130 | Tiny persistent store for the ONLY data that lives on disk: bookmarks and settings. |
+| `src/browser/tabs.rs` | 73 |  |
+| `src/dom_bootstrap.js` | 562 |  |
+| `src/dro_blocklist.rs` | 124 | Tracker / ad blocking for sub-resources (scripts, images, CSS, media). Top-level navigation is never blocked. |
+| `src/dro_cache.rs` | 187 | RAM-only HTTP cache (never written to disk): Cache-Control max-age / no-store / no-cache / immutable, |
+| `src/dro_charset.rs` | 91 | Charset detection + decoding without extra crates. |
+| `src/dro_css.rs` | 232 |  |
+| `src/dro_css_ext.rs` | 312 | CSS pre-processor: turns modern CSS into the subset `dro_css::parse` understands. |
+| `src/dro_dom.rs` | 83 |  |
+| `src/dro_dom_js.rs` | 110 | Bridge between our Rust DOM and the JS DOM layer (`dom_bootstrap.js`). |
+| `src/dro_font.rs` | 615 | dro_font v2 — real text for Sparrow: system fonts (fontdb), OpenType shaping (rustybuzz, Bangla conjuncts), |
+| `src/dro_html.rs` | 118 |  |
+| `src/dro_js.rs` | 44 |  |
+| `src/dro_layout.rs` | 563 | Sparrow layout: DOM + computed styles -> positioned paint items (via taffy). |
+| `src/dro_media.rs` | 336 | Pure-Rust media player (no FFmpeg, no C). |
+| `src/dro_media_ui.rs` | 120 | Chromium-style media control bar: draw + hit-test. Coordinates are relative to the media box. |
+| `src/dro_net.rs` | 727 | dro_net.rs — Sparrow network stack. RAM-only: cookies, cache, HSTS never touch disk. |
+| `src/dro_paint.rs` | 190 | Sparrow paint: layout items -> RGBA pixels (tiny-skia + built-in 5x7 bitmap font). |
+| `src/engine_host.rs` | 384 | Runs the engine on its OWN thread with a big stack and talks to it through messages. |
+| `src/ffi.rs` | 215 | C ABI for the shell (Go/cgo, C, C++). All functions are panic-safe: a panic never crosses FFI. |
+| `src/forms.rs` | 239 | HTML form submission: collect successful controls (HTML spec 4.10.21), urlencode, build GET/POST request. |
+| `src/input.rs` | 393 | Text editing model for <input>/<textarea>: caret, selection, typing, delete, word/line movement, |
+| `src/js_engine.rs` | 44 | JS engine abstraction: DOM/bridge code should depend on `JsEngine`, never on boa directly. |
+| `src/lib.rs` | 34 | Sparrow Engine: Rust browser engine embedded in the Sparrow shell. |
+| `src/safety.rs` | 137 | Crash/hang protection helpers (std only). |
+| `src/sparrow_engine.rs` | 257 | SparrowEngine: one page = DOM + styles + layout + JS + media. Everything is RAM-only. |
+| `src/sparrow_engine/bridge.rs` | 265 | Child module of `sparrow_engine` (so it can touch private fields). |
+| `src/sparrow_engine/media_bridge.rs` | 225 | Child module of `sparrow_engine`: connects <video>/<audio> elements to `dro_media::Media`. |
+| `tests/fixes.rs` | 43 | Regression tests for the fixes in CHANGES.md. Run: cargo test --test fixes |
+| `tests/regression.rs` | 53 |  |
+| `tests/smoke.rs` | 55 | Smoke tests: run `cargo test --test smoke` after the crate builds. |
+| `tools/integration_check.py` | 139 |  |
+
+---
+
+## Pipeline walkthrough
+
+### Network
+
+Files: `dro_net.rs`
+
+Blocking reqwest client, `Request`/`send`, `fetch`, `fetch_max`, `fetch_range`, `post_form`, `par_map`. Cookie jar (`RamJar`), cache, HSTS, https-first, private-network sub-resource guard.
+
+### Charset
+
+Files: `dro_charset.rs`
+
+BOM, `Content-Type` charset, `<meta charset>` sniffing, `encoding_rs` decode.
+
+### HTML
+
+Files: `dro_html.rs`
+
+html5ever tree builder into the arena `Dom`.
+
+### DOM
+
+Files: `dro_dom.rs`
+
+`Node { kind, parent, children }`, `NodeKind::{Document, Element, Text, Comment}`.
+
+### CSS
+
+Files: `dro_css.rs, dro_css_ext.rs`
+
+Parser, selectors, cascade, `Style`; extensions for calc/vars/media queries.
+
+### Layout
+
+Files: `dro_layout.rs`
+
+`compute(dom, styles, width, base, image_sizes)` builds a taffy tree and a flat list of paint items.
+
+### Fonts
+
+Files: `dro_font.rs`
+
+fontdb discovery, rustybuzz shaping, bidi runs, line breaks, web fonts, caret stops.
+
+### Paint
+
+Files: `dro_paint.rs`
+
+`paint(layout, w, h, scroll, images)`; `decode_image`.
+
+### JS
+
+Files: `dro_js.rs, js_engine.rs, dom_bootstrap.js, dro_dom_js.rs`
+
+Boa context with loop and recursion limits; DOM shim in JS; native bridge in Rust.
+
+### Media
+
+Files: `dro_media.rs, dro_media_ui.rs, media_bridge.rs`
+
+symphonia decode, cpal output, GIF frames, control bar overlay.
+
+### Safety
+
+Files: `safety.rs`
+
+RAM log ring, panic hook, `run_guarded`, `run_big_stack`, `run_with_timeout`, `Deadline`, `limits`.
+
+---
+
+## Module reference
+
+Generated from `///` docs and `pub` items. Test modules are excluded.
+
+### `src/browser/bookmark.rs`
+
+| Kind | Name | Signature | Doc |
 |---|---|---|---|
-| 1 | `html5ever` 0.26 | HTML5 tokenizer + tree builder | USED |
-| 2 | `markup5ever` | names/atoms used by html5ever (transitive) | USED (transitive) |
-| 3 | `taffy` 0.4 | block + flexbox layout (grid later) | USED |
-| 4 | `boa_engine` 0.17 | JavaScript interpreter | USED |
-| 5 | `tiny-skia` 0.11 | CPU 2D rasteriser (current paint backend) | USED |
-| 6 | `reqwest` 0.11 (`blocking`,`rustls-tls`) | HTTP client | USED |
-| 7 | `rustls` | TLS, no OpenSSL / no OS dependency | USED (transitive) |
-| 8 | `image` 0.24 (`png`,`jpeg`,`gif`) | image decoding | USED |
-| 9 | `rusqlite` 0.30 (`bundled`) | history, bookmarks, later cookies/cache/localStorage | USED |
-| 10 | `url` 2.4 | URL parsing/joining | USED |
-| 11 | `serde` 1.0 | (de)serialisation of settings, IPC messages | USED (declared, light use) |
-| 12 | `parley` 0.1 | text layout/shaping API | PLAN |
-| 13 | `vello` 0.1 | GPU 2D renderer (compute-based) | PLAN |
-| 14 | `wgpu` 0.19 | GPU abstraction (must match vello's wgpu version) | PLAN |
-| 15 | `winit` 0.28 | windowing — only for a standalone test harness (the shell owns the real window) | PLAN |
-| 16 | `usvg` 0.36 | SVG parsing → paths (renders via vello/tiny-skia) | PLAN |
-| 17 | `stylist` 0.12 | **Not suitable** (Yew-focused). Replaced by own `dro_css`. | REJECTED |
-| 18 | `cssparser` | robust CSS tokenizer (Servo) — replace hand-rolled parser | PROPOSE |
-| 19 | `selectors` | spec-correct selector matching incl. pseudo-classes | PROPOSE |
-| 20 | `fontdb` | system/web font discovery & matching | PROPOSE |
-| 21 | `swash` / `ttf-parser` | glyph outlines, shaping fallback, metrics | PROPOSE |
-| 22 | `unicode-bidi` | bidirectional text (Arabic/Hebrew mixed with LTR) | PROPOSE |
-| 23 | `unicode-linebreak` | UAX #14 line breaking | PROPOSE |
-| 24 | `unicode-segmentation` | grapheme clusters (Bangla conjuncts, emoji) | PROPOSE |
-| 25 | `encoding_rs` | charset decoding (legacy encodings) | PROPOSE |
-| 26 | `flate2` / `brotli` | gzip/brotli response decoding | PROPOSE |
-| 27 | `rayon` | parallel style computation / image decode | PROPOSE |
-| 28 | `crossbeam-channel` | engine ⇄ worker/UI messaging | PROPOSE |
-| 29 | `lru` | image / font / HTTP caches | PROPOSE |
-| 30 | `hashbrown` / `ahash` | faster hash maps for style/layout tables | PROPOSE |
-| 31 | `smallvec` | avoid heap allocs for small child lists | PROPOSE |
-| 32 | `bumpalo` | arena allocation for per-frame temporary data | PROPOSE |
-| 33 | `cookie_store` | cookie jar with RFC 6265 rules | PROPOSE |
-| 34 | `tracing` | structured logs/profiling spans | PROPOSE |
-| 35 | `criterion` | benchmarks (dev-dependency) | PROPOSE |
-| 36 | `proptest` | fuzz-like property tests for parsers (dev-dependency) | PROPOSE |
-| 37 | `lightningcss` | alternative full CSS parser/minifier | PROPOSE (alternative to 18) |
+| struct | `Bookmarks` | `pub struct Bookmarks` |  |
+| fn | `open` | `pub fn open(path: &str) -> Result<Self, String>` |  |
+| fn | `add` | `pub fn add(&self, url: &str, title: &str) -> Result<(), String>` |  |
+| fn | `remove` | `pub fn remove(&self, url: &str) -> Result<(), String>` |  |
+| fn | `contains` | `pub fn contains(&self, url: &str) -> Result<bool, String>` |  |
+| fn | `list` | `pub fn list(&self) -> Result<Vec<(String, String)>, String>` |  |
 
-> If the 15-library rule must stay strict, Phases 0–1 and the `parley`/`vello`/`wgpu`/`usvg` parts of Phases 2/5/7 fit inside it. The rest require an explicit decision.
+### `src/browser/history.rs`
+
+History is RAM-only by design: nothing is written to disk, everything is gone on exit.
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| struct | `Entry` | `pub struct Entry` |  |
+| struct | `History` | `pub struct History` |  |
+| fn | `new` | `pub fn new() -> Self` |  |
+| fn | `open` | `pub fn open(_path: &str) -> Result<Self, String>` | Compatibility with the old SQLite API: the path is ignored on purpose. |
+| fn | `add` | `pub fn add(&mut self, url: &str, title: &str) -> Result<(), String>` |  |
+| fn | `search` | `pub fn search(&self, q: &str, limit: usize) -> Result<Vec<(String, String)>, String>` |  |
+| fn | `recent` | `pub fn recent(&self, limit: usize) -> Vec<Entry>` |  |
+| fn | `delete_since` | `pub fn delete_since(&mut self, secs_ago: i64)` |  |
+| fn | `clear` | `pub fn clear(&mut self) -> Result<(), String>` |  |
+| fn | `len` | `pub fn len(&self) -> usize` |  |
+| fn | `is_empty` | `pub fn is_empty(&self) -> bool` |  |
+
+Tests: `add_search_clear`, `ignores_blank_and_caps`
+
+### `src/browser/mod.rs`
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| mod | `bookmark` | `pub mod bookmark` |  |
+| mod | `history` | `pub mod history` |  |
+| mod | `omnibox` | `pub mod omnibox` |  |
+| mod | `session` | `pub mod session` |  |
+| mod | `settings` | `pub mod settings` |  |
+| mod | `tabs` | `pub mod tabs` |  |
+
+### `src/browser/omnibox.rs`
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| const | `SEARCH` | `pub const SEARCH: &str = "https://duckduckgo.com/?q="` | Search engine (not Google/MS). Change if you want. |
+| fn | `resolve` | `pub fn resolve(input: &str) -> String` |  |
+
+### `src/browser/session.rs`
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| struct | `Session` | `pub struct Session` | Save/restore open tabs between runs. |
+| struct | `Restored` | `pub struct Restored` |  |
+| fn | `open` | `pub fn open(path: &str) -> Result<Self, String>` |  |
+| fn | `save` | `pub fn save(&mut self, tabs: &mut Tabs) -> Result<(), String>` | Snapshot all tabs (blank tabs are skipped). |
+| fn | `load` | `pub fn load(&self) -> Result<Restored, String>` | Read the saved list. The shell decides how to load (recommended: load only the active tab, others lazily). |
+| fn | `clear` | `pub fn clear(&self) -> Result<(), String>` |  |
+
+### `src/browser/settings.rs`
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| struct | `Settings` | `pub struct Settings` | Simple persistent key/value settings (SQLite). Keys used by the shell: "search_engine", "homepage", "js_enabled", "theme". |
+| fn | `open` | `pub fn open(path: &str) -> Result<Self, String>` |  |
+| fn | `get` | `pub fn get(&self, key: &str) -> Result<Option<String>, String>` |  |
+| fn | `get_or` | `pub fn get_or(&self, key: &str, default: &str) -> String` |  |
+| fn | `set` | `pub fn set(&self, key: &str, value: &str) -> Result<(), String>` |  |
+| fn | `remove` | `pub fn remove(&self, key: &str) -> Result<(), String>` |  |
+
+### `src/browser/store.rs`
+
+Tiny persistent store for the ONLY data that lives on disk: bookmarks and settings.
+Plain text file (`key<TAB>value` per line, `\\ \t \n` escaped), atomic write (tmp + rename). No SQLite.
+History, sessions, cache are RAM-only by design.
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| struct | `Store` | `pub struct Store` |  |
+| fn | `memory` | `pub fn memory() -> Self` |  |
+| fn | `open` | `pub fn open(path: &str) -> Result<Self, String>` | Missing file = empty store. Corrupt lines are skipped, never fatal. |
+| fn | `get` | `pub fn get(&self, k: &str) -> Option<&str>` |  |
+| fn | `set` | `pub fn set(&mut self, k: &str, v: &str) -> Result<(), String>` |  |
+| fn | `remove` | `pub fn remove(&mut self, k: &str) -> Result<bool, String>` |  |
+| fn | `with_prefix` | `pub fn with_prefix(&self, prefix: &str) -> Vec<(String, String)>` |  |
+| fn | `len` | `pub fn len(&self) -> usize` |  |
+| struct | `Bookmarks` | `pub struct Bookmarks` | Same API as the old SQLite `Bookmarks`. |
+| fn | `open` | `pub fn open(path: &str) -> Result<Self, String>` |  |
+| fn | `memory` | `pub fn memory() -> Self` |  |
+| fn | `add` | `pub fn add(&mut self, url: &str, title: &str) -> Result<(), String>` |  |
+| fn | `remove` | `pub fn remove(&mut self, url: &str) -> Result<(), String>` |  |
+| fn | `contains` | `pub fn contains(&self, url: &str) -> Result<bool, String>` |  |
+| fn | `list` | `pub fn list(&self) -> Result<Vec<(String, String)>, String>` | (url, title), sorted by url. |
+| struct | `Settings` | `pub struct Settings` | Same API as the old SQLite `Settings`. |
+| fn | `open` | `pub fn open(path: &str) -> Result<Self, String>` |  |
+| fn | `memory` | `pub fn memory() -> Self` |  |
+| fn | `get` | `pub fn get(&self, k: &str) -> Result<Option<String>, String>` |  |
+| fn | `get_or` | `pub fn get_or(&self, k: &str, default: &str) -> String` |  |
+| fn | `set` | `pub fn set(&mut self, k: &str, v: &str) -> Result<(), String>` |  |
+| fn | `remove` | `pub fn remove(&mut self, k: &str) -> Result<(), String>` |  |
+
+Tests: `corrupt_lines_skipped_and_prefixes_isolated`, `memory_mode_never_touches_disk`, `roundtrip_with_special_chars`, `settings_defaults_and_remove`
+
+### `src/browser/tabs.rs`
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| struct | `Tab` | `pub struct Tab` |  |
+| struct | `Tabs` | `pub struct Tabs` |  |
+| fn | `new` | `pub fn new() -> Self` |  |
+| fn | `open` | `pub fn open(&mut self) -> u32` |  |
+| fn | `close` | `pub fn close(&mut self, id: u32)` |  |
+| fn | `switch` | `pub fn switch(&mut self, id: u32)` |  |
+| fn | `list` | `pub fn list(&self) -> &[Tab]` |  |
+| fn | `active` | `pub fn active(&mut self) -> &mut Tab` |  |
+| fn | `navigate` | `pub fn navigate(&mut self, input: &str) -> Result<(), String>` | Address bar text -> navigate active tab. |
+| fn | `go_back` | `pub fn go_back(&mut self) -> Result<(), String>` |  |
+| fn | `go_forward` | `pub fn go_forward(&mut self) -> Result<(), String>` |  |
+
+### `src/dro_blocklist.rs`
+
+Tracker / ad blocking for sub-resources (scripts, images, CSS, media). Top-level navigation is never blocked.
+Rules: hosts-file lines (`0.0.0.0 ads.example.com`), `||domain^`, plain domains, and `/path/` substring patterns.
+Pure std + `url`. Shell can load bigger lists (EasyList-hosts style) with `with_global(|b| b.load_list(text))`.
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| struct | `Blocker` | `pub struct Blocker` |  |
+| fn | `new` | `pub fn new() -> Self` |  |
+| fn | `empty` | `pub fn empty() -> Self` |  |
+| fn | `add_rule` | `pub fn add_rule(&mut self, rule: &str)` |  |
+| fn | `load_list` | `pub fn load_list(&mut self, text: &str)` | Whitespace/newline separated rules, `#`/`!` comments allowed. |
+| fn | `rule_count` | `pub fn rule_count(&self) -> usize` |  |
+| fn | `is_blocked` | `pub fn is_blocked(&self, url: &str, page_url: &str) -> bool` | Is `url` (a sub-resource of the page at `page_url`) blocked? First-party requests are never blocked. |
+| fn | `with_global` | `pub fn with_global<R>(f: impl FnOnce(&mut Blocker) -> R) -> Option<R>` |  |
+| fn | `global_blocked` | `pub fn global_blocked(url: &str, page_url: &str) -> bool` | Sub-resource check used by the network layer. |
+
+Tests: `blocks_third_party_trackers`, `first_party_never_blocked`, `list_formats`
+
+### `src/dro_cache.rs`
+
+RAM-only HTTP cache (never written to disk): Cache-Control max-age / no-store / no-cache / immutable,
+ETag + Last-Modified revalidation (304), byte-bounded LRU. GET 200 responses only.
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| struct | `Entry` | `pub struct Entry` |  |
+| struct | `Headers` | `pub struct Headers<'a>` | Response headers relevant to caching (pass `None` for absent ones). |
+| struct | `Policy` | `pub struct Policy` |  |
+| fn | `parse_cache_control` | `pub fn parse_cache_control(h: &str) -> Policy` |  |
+| enum | `Lookup` | `pub enum Lookup<'a>` |  |
+| struct | `Cache` | `pub struct Cache` |  |
+| fn | `new` | `pub fn new(max_bytes: usize) -> Self` |  |
+| fn | `lookup` | `pub fn lookup(&mut self, url: &str) -> Lookup<'_>` |  |
+| fn | `lookup_at` | `pub fn lookup_at(&mut self, url: &str, now: Instant) -> Lookup<'_>` |  |
+| fn | `store` | `pub fn store(&mut self, url: &str, status: u16, content_type: &str, body: Vec<u8>, h: Headers<'_>) -> bool` | Store a 200 GET response. Returns false when policy/size says not to cache it. |
+| fn | `store_at` | `pub fn store_at(&mut self, url: &str, status: u16, content_type: &str, body: Vec<u8>, h: Headers<'_>, now: Instant) -> bool` |  |
+| fn | `refresh` | `pub fn refresh(&mut self, url: &str, h: Headers<'_>) -> Option<&Entry>` | Server answered 304: the stored body is valid again (optionally with new max-age). |
+| fn | `refresh_at` | `pub fn refresh_at(&mut self, url: &str, h: Headers<'_>, now: Instant) -> Option<&Entry>` |  |
+| fn | `remove` | `pub fn remove(&mut self, url: &str)` |  |
+| fn | `clear` | `pub fn clear(&mut self)` |  |
+| fn | `len` | `pub fn len(&self) -> usize` |  |
+| fn | `bytes` | `pub fn bytes(&self) -> usize` |  |
+
+Tests: `fresh_then_stale_then_refresh`, `lru_eviction_by_bytes_and_entry_cap`, `parses_policy`, `policy_rules`, `touch_protects_recent_and_replace_updates_size`
+
+### `src/dro_charset.rs`
+
+Charset detection + decoding without extra crates.
+Supports: UTF-8 (+BOM), UTF-16 LE/BE (BOM), ISO-8859-1, windows-1252, ASCII.
+Unknown labels (gbk, shift_jis, ...) fall back to lossy UTF-8.
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| fn | `charset_from_header` | `pub fn charset_from_header(ct: &str) -> Option<String>` | Extract `charset=xxx` from a Content-Type header value. |
+| fn | `charset_from_meta` | `pub fn charset_from_meta(body: &[u8]) -> Option<String>` | Look for `<meta charset=..>` / `<meta http-equiv content="..charset=..">` in the first 2 KB. |
+| fn | `decode` | `pub fn decode(body: &[u8], content_type: &str) -> String` |  |
+
+Tests: `decode_bom_and_utf8`, `decode_latin1_and_cp1252`, `header_charset`, `meta_charset`
+
+### `src/dro_css.rs`
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| struct | `Color` | `pub struct Color(pub u8, pub u8, pub u8)` |  |
+| enum | `Display` | `pub enum Display` |  |
+| struct | `Style` | `pub struct Style` |  |
+| struct | `Rule` | `pub struct Rule` |  |
+| const | `UA` | `pub const UA: &str = "html,body,div,p,h1,h2,h3,h4,h5,h6,ul,ol,li,section,article,header,footer,nav,main,form,table,tr,pre,blockquote` |  |
+| fn | `parse_color` | `pub fn parse_color(s: &str) -> Option<Color>` |  |
+| fn | `parse` | `pub fn parse(css: &str) -> Vec<Rule>` |  |
+| fn | `compute` | `pub fn compute(dom: &Dom, rules: &[Rule]) -> Vec<Option<Style>>` |  |
+
+### `src/dro_css_ext.rs`
+
+CSS pre-processor: turns modern CSS into the subset `dro_css::parse` understands.
+Handles: @media (min/max-width/height, orientation, screen/print), @supports (assumed true),
+`:root` -> `html`, custom properties `var(--x, fallback)`, `vw/vh/vmin/vmax` units, `calc()`.
+Pure text -> text, no dependencies. Call as `dro_css::parse(&preprocess(css, vw, vh))`.
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| fn | `preprocess` | `pub fn preprocess(css: &str, vw: f32, vh: f32) -> String` |  |
+| fn | `media_matches` | `pub fn media_matches(q: &str, vw: f32, vh: f32) -> bool` |  |
+
+Tests: `at_rules_dropped`, `calc_eval`, `media_filtering`, `media_queries`, `units`, `vars`
+
+### `src/dro_dom.rs`
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| type | `NodeId` | `pub type NodeId = usize` |  |
+| enum | `NodeKind` | `pub enum NodeKind` |  |
+| struct | `Node` | `pub struct Node` |  |
+| struct | `Dom` | `pub struct Dom` |  |
+| fn | `new` | `pub fn new() -> Self` |  |
+| fn | `create` | `pub fn create(&mut self, kind: NodeKind) -> NodeId` |  |
+| fn | `detach` | `pub fn detach(&mut self, id: NodeId)` |  |
+| fn | `append_child` | `pub fn append_child(&mut self, parent: NodeId, child: NodeId)` |  |
+| fn | `insert_before` | `pub fn insert_before(&mut self, sibling: NodeId, child: NodeId)` |  |
+| fn | `tag` | `pub fn tag(&self, id: NodeId) -> Option<&str>` |  |
+| fn | `attr` | `pub fn attr(&self, id: NodeId, name: &str) -> Option<&str>` |  |
+| fn | `descendants` | `pub fn descendants(&self, id: NodeId) -> Vec<NodeId>` | Preorder list of all descendants |
+| fn | `text_content` | `pub fn text_content(&self, id: NodeId) -> String` |  |
+| fn | `find_tag` | `pub fn find_tag(&self, tag: &str) -> Option<NodeId>` |  |
+
+### `src/dro_dom_js.rs`
+
+Bridge between our Rust DOM and the JS DOM layer (`dom_bootstrap.js`).
+Only uses `JsRuntime::eval` (no boa-specific API) so it is robust to boa version changes.
+Flow: Rust DOM -> JS literal -> hydrate -> scripts mutate JS DOM -> `__serialize()` -> html5ever re-parse.
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| fn | `js_string` | `pub fn js_string(s: &str) -> String` | Escape a Rust string as a double-quoted JS string literal. |
+| fn | `dom_literal` | `pub fn dom_literal(dom: &Dom) -> Result<String, String>` | DOM -> `[[kind, text_or_tag, [[attr,val]..], [childIds..]], ...]` (index == NodeId). kind: 0 document, 1 element, 2 text, 3 comment. Script  |
+| fn | `install` | `pub fn install(rt: &mut JsRuntime, dom: &Dom, url: &str, _title: &str, vw: u32, vh: u32) -> Result<(), String>` |  |
+| fn | `lifecycle` | `pub fn lifecycle(rt: &mut JsRuntime)` | Fire DOMContentLoaded, run pending timers (max 1s virtual time), fire load. |
+| fn | `run_timers` | `pub fn run_timers(rt: &mut JsRuntime, ms: u32) -> usize` | Advance the virtual clock by `ms` and run due timers. Returns how many ran. |
+| fn | `serialize_if_dirty` | `pub fn serialize_if_dirty(rt: &mut JsRuntime) -> Result<Option<String>, String>` | `Some(html)` only if JS changed the DOM since the last call. |
+| fn | `take_navigation` | `pub fn take_navigation(rt: &mut JsRuntime) -> Option<String>` | Navigation requested by JS (`location.href = ..`, clicked link, `window.open`). |
+| fn | `fire` | `pub fn fire(rt: &mut JsRuntime, element_id: &str, event: &str) -> Result<bool, String>` | Dispatch a DOM event on the element with the given `id` attribute. |
+
+Tests: `escapes`, `literal_shape`
+
+### `src/dro_font.rs`
+
+dro_font v2 — real text for Sparrow: system fonts (fontdb), OpenType shaping (rustybuzz, Bangla conjuncts),
+bidi (unicode-bidi), CSS font-family lists, weights 100-900, italic (real or synthetic), web fonts (TTF/OTF),
+glyph-mask cache with 1/4-pixel horizontal positioning, caret/cluster positions (for text input),
+letter-spacing, underline/strike, line-break opportunities, RAM-light lazy face loading.
+Cargo: unicode-bidi = "0.3", unicode-linebreak = "0.1" (plus existing fontdb, rustybuzz, tiny-skia).
+Old API kept: Fonts::{new,count,has_fonts,shape,measure,metrics,draw}, with/available/measure/draw_text.
+NOT yet: WOFF/WOFF2 (decompress first), colour emoji, vertical text, hinting, LCD subpixel AA.
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| struct | `TextStyle` | `pub struct TextStyle` |  |
+| fn | `new` | `pub fn new(size: f32) -> Self` |  |
+| fn | `bold` | `pub fn bold(mut self, b: bool) -> Self` |  |
+| fn | `weight` | `pub fn weight(mut self, w: u16) -> Self` |  |
+| fn | `italic` | `pub fn italic(mut self, i: bool) -> Self` |  |
+| fn | `families` | `pub fn families(mut self, css: &str) -> Self` |  |
+| fn | `spacing` | `pub fn spacing(mut self, px: f32) -> Self` |  |
+| fn | `parse_families` | `pub fn parse_families(css: &str) -> Vec<String>` | Parse a CSS `font-family` value: `Roboto, "Helvetica Neue", sans-serif`. |
+| struct | `G` | `pub struct G` |  |
+| struct | `Shaped` | `pub struct Shaped` |  |
+| struct | `Metrics` | `pub struct Metrics` |  |
+| fn | `bidi_runs` | `pub fn bidi_runs(text: &str) -> Vec<(Range<usize>, bool)>` | Visual-order runs `(byte range, is_rtl)`. Pure LTR text takes the fast path. |
+| fn | `line_breaks` | `pub fn line_breaks(text: &str) -> Vec<(usize, bool)>` | Byte offsets where a line may break (`true` = forced break). UAX #14. |
+| fn | `index_at_x` | `pub fn index_at_x(stops: &[(usize, f32)], x: f32) -> usize` | Nearest caret stop (byte index) to pixel `x`. |
+| struct | `Fonts` | `pub struct Fonts` |  |
+| fn | `new` | `pub fn new() -> Self` |  |
+| fn | `count` | `pub fn count(&self) -> usize` | Number of fonts found on this system (plus registered web fonts). |
+| fn | `loaded_faces` | `pub fn loaded_faces(&self) -> usize` | Faces actually loaded into RAM (lazy: only fonts that were needed). |
+| fn | `has_fonts` | `pub fn has_fonts(&mut self) -> bool` |  |
+| fn | `shape` | `pub fn shape(&mut self, text: &str, size: f32, bold: bool) -> Shaped` |  |
+| fn | `shape_style` | `pub fn shape_style(&mut self, text: &str, st: &TextStyle) -> Shaped` |  |
+| fn | `measure` | `pub fn measure(&mut self, text: &str, size: f32, bold: bool) -> f32` |  |
+| fn | `measure_style` | `pub fn measure_style(&mut self, text: &str, st: &TextStyle) -> f32` |  |
+| fn | `caret_stops` | `pub fn caret_stops(&mut self, text: &str, st: &TextStyle) -> Vec<(usize, f32)>` | Caret stops `(byte index, x)` in logical order, always starting at 0 and ending at `text.len()`. Ligatures / Bangla conjuncts are one stop ( |
+| fn | `metrics_style` | `pub fn metrics_style(&mut self, st: &TextStyle) -> Metrics` |  |
+| fn | `metrics` | `pub fn metrics(&mut self, size: f32, bold: bool) -> (f32, f32)` | (ascent, descent) in px for the primary face. |
+| fn | `register_web_font` | `pub fn register_web_font(&mut self, alias: &str, data: Vec<u8>, weight: u16, italic: bool) -> bool` | Register a TTF/OTF/TTC web font under a CSS family `alias`. WOFF/WOFF2 must be decompressed first. |
+| fn | `clear_web_fonts` | `pub fn clear_web_fonts(&mut self)` | Drop all web fonts (call on navigation): frees their RAM. |
+| fn | `draw` | `pub fn draw(&mut self, pm: &mut Pixmap, s: &Shaped, x: f32, baseline: f32, rgb: (u8, u8, u8), bold: bool)` | Draw shaped text with its baseline at `baseline`, left edge at `x`. |
+| fn | `draw_decoration` | `pub fn draw_decoration(&mut self, pm: &mut Pixmap, x: f32, baseline: f32, width: f32, st: &TextStyle, rgb: (u8, u8, u8), underline: bool, strike: b...` |  |
+| fn | `with` | `pub fn with<R>(f: impl FnOnce(&mut Fonts) -> R) -> R` |  |
+| fn | `available` | `pub fn available() -> bool` | True when at least one usable system font exists (else callers use the bitmap font). |
+| fn | `measure` | `pub fn measure(text: &str, size: f32, bold: bool) -> f32` |  |
+| fn | `measure_style` | `pub fn measure_style(text: &str, st: &TextStyle) -> f32` |  |
+| fn | `caret_stops` | `pub fn caret_stops(text: &str, st: &TextStyle) -> Vec<(usize, f32)>` |  |
+| fn | `register_web_font` | `pub fn register_web_font(alias: &str, data: Vec<u8>, weight: u16, italic: bool) -> bool` |  |
+| fn | `clear_web_fonts` | `pub fn clear_web_fonts()` |  |
+| fn | `draw_text` | `pub fn draw_text(pm: &mut Pixmap, text: &str, x: f32, y: f32, box_h: f32, size: f32, bold: bool, rgb: (u8, u8, u8)) -> bool` | Draw `text` vertically centred in a box of height `box_h` whose top is `y`. Returns false if no fonts. |
+| fn | `draw_text_style` | `pub fn draw_text_style(pm: &mut Pixmap, text: &str, x: f32, y: f32, box_h: f32, st: &TextStyle, rgb: (u8, u8, u8)) -> bool` | Same with a full style (family list, weight, italic, letter-spacing). |
+
+Tests: `bidi_fast_path_and_rtl`, `caret_stops_are_monotonic_and_cluster_aware`, `css_family_parsing`, `index_at_x_picks_nearest`, `latin_and_bangla_shape`, `lazy_loading_latin_loads_few_faces`, `line_break_opportunities`, `mask_raster_and_blit`, `renders_pixels`, `rtl_shaping_does_not_panic`, `style_builder_clamps`, `styles_change_width_and_cache_hits`, `synthetic_italic_shifts_top`, `web_font_rejects_garbage_and_woff`
+
+### `src/dro_html.rs`
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| struct | `H` | `pub struct H` |  |
+| fn | `parse` | `pub fn parse(html: &str) -> Result<Dom, String>` |  |
+
+### `src/dro_js.rs`
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| struct | `JsRuntime` | `pub struct JsRuntime` |  |
+| fn | `new` | `pub fn new() -> Result<Self, String>` |  |
+| fn | `eval` | `pub fn eval(&mut self, code: &str) -> Result<String, String>` |  |
+| fn | `take_logs` | `pub fn take_logs(&self) -> Vec<String>` |  |
+
+### `src/dro_layout.rs`
+
+Sparrow layout: DOM + computed styles -> positioned paint items (via taffy).
+
+Public API (unchanged): `Paint`, `Item`, `Layout`, `compute`.
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| enum | `Paint` | `pub enum Paint` |  |
+| struct | `Item` | `pub struct Item` |  |
+| struct | `Layout` | `pub struct Layout` |  |
+| fn | `is_virama` | `pub(crate) fn is_virama(c: char) -> bool` |  |
+| fn | `cells` | `pub(crate) fn cells(c: char, after_virama: bool) -> f32` | Approximate width of one char in "cells" (1 cell = one `advance(size)`). Combining marks take no space, a consonant joined by a virama (Beng |
+| fn | `compute` | `pub fn compute(dom: &Dom, st: &[Option<Style>], width: f32, base: &str, imgs: &HashMap<String, (u32, u32)>) -> Result<Layout, String>` |  |
+
+### `src/dro_media.rs`
+
+Pure-Rust media player (no FFmpeg, no C).
+Audio : symphonia (mp3/aac/flac/vorbis/ogg/wav/mp4-audio/mkv-audio) -> linear resampler -> cpal output.
+Clock : audio clock is master (like Chromium). No-audio media uses a wall clock.
+Video : animated GIF decoded in pure Rust; MP4 video is probed (size/fps/codec) but needs a decoder backend
+(AV1 via rav1d is the planned pure-Rust one). Audio of MP4 files plays today.
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| struct | `Frame` | `pub struct Frame` |  |
+| struct | `VideoInfo` | `pub struct VideoInfo` |  |
+| struct | `Media` | `pub struct Media` |  |
+| fn | `probe_mp4` | `pub fn probe_mp4(bytes: &[u8]) -> Option<VideoInfo>` | MP4 video track info (size, fps, codec) with the pure-Rust `mp4` crate. |
+| fn | `open` | `pub fn open(bytes: Vec<u8>, hint: &str) -> Result<Media, String>` | `hint` = file extension or mime subtype ("mp3", "mp4", "ogg", ...), may be "". |
+| fn | `play` | `pub fn play(&mut self)` |  |
+| fn | `pause` | `pub fn pause(&mut self)` |  |
+| fn | `paused` | `pub fn paused(&self) -> bool` |  |
+| fn | `ended` | `pub fn ended(&self) -> bool` |  |
+| fn | `set_volume` | `pub fn set_volume(&mut self, v: f32)` |  |
+| fn | `volume` | `pub fn volume(&self) -> f32` |  |
+| fn | `set_muted` | `pub fn set_muted(&mut self, m: bool)` |  |
+| fn | `muted` | `pub fn muted(&self) -> bool` |  |
+| fn | `has_audio` | `pub fn has_audio(&self) -> bool` |  |
+| fn | `seek` | `pub fn seek(&mut self, secs: f64)` |  |
+| fn | `current_time` | `pub fn current_time(&self) -> f64` | Current playback position in seconds (audio clock when audio exists). |
+| fn | `frame` | `pub fn frame(&self) -> Option<&Frame>` | Frame to show right now (animated GIF). None for audio-only / undecodable video. |
+| fn | `video_supported` | `pub fn video_supported(&self) -> bool` | True when the video track can be shown (a decoder backend exists). |
+
+Tests: `bad_input_is_error`, `channel_conversion`, `resampler_ratio`, `wall_clock`
+
+### `src/dro_media_ui.rs`
+
+Chromium-style media control bar: draw + hit-test. Coordinates are relative to the media box.
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| const | `BAR_H` | `pub const BAR_H: f32 = 36.0` |  |
+| enum | `Action` | `pub enum Action` |  |
+| struct | `State` | `pub struct State` |  |
+| fn | `fmt_time` | `pub fn fmt_time(s: f64) -> String` |  |
+| fn | `hit` | `pub fn hit(x: f32, y: f32, w: f32, h: f32, duration: f64) -> Option<Action>` | `x`,`y` relative to the media box (w x h). Returns the action for a click on the bar. |
+| fn | `draw` | `pub fn draw(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, s: &State)` |  |
+
+Tests: `draws_without_panic`, `hits`, `time_format`
+
+### `src/dro_net.rs`
+
+dro_net.rs — Sparrow network stack. RAM-only: cookies, cache, HSTS never touch disk.
+Cargo: reqwest = { version = "0.11", default-features = false,
+features = ["blocking","rustls-tls","cookies","gzip","brotli","deflate","http2"] }  (>= 0.11.18)
+Old API kept: Response, fetch, fetch_sub, par_map(urls, f), decode, resolve.
+New: fetch_max, fetch_range, post_form, send(Request), par_map_page, RAM cookie jar (export/import
+for a login vault), HTTP cache + revalidation, HSTS, HTTPS-first, retries, Chrome-like headers,
+referrer policy, private-network protection, data: URLs, MIME sniffing, stats.
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| struct | `Response` | `pub struct Response` |  |
+| struct | `Config` | `pub struct Config` |  |
+| fn | `config` | `pub fn config() -> Config` |  |
+| fn | `set_config` | `pub fn set_config(c: Config)` |  |
+| struct | `Stats` | `pub struct Stats` |  |
+| fn | `stats` | `pub fn stats() -> Stats` |  |
+| fn | `set_page` | `pub fn set_page(u: &str)` |  |
+| fn | `reg_domain` | `pub fn reg_domain(host: &str) -> String` |  |
+| fn | `same_site` | `pub fn same_site(a: &str, b: &str) -> bool` |  |
+| struct | `Cookie` | `pub struct Cookie` |  |
+| struct | `RamJar` | `pub struct RamJar` |  |
+| fn | `parse_http_date` | `pub fn parse_http_date(s: &str) -> Option<u64>` |  |
+| fn | `new` | `pub fn new() -> Self` |  |
+| fn | `len` | `pub fn len(&self) -> usize` |  |
+| fn | `clear` | `pub fn clear(&self)` |  |
+| fn | `clear_host` | `pub fn clear_host(&self, host: &str)` |  |
+| fn | `export` | `pub fn export(&self, only_sites: Option<&[&str]>, session_ttl: u64) -> String` | Tab-separated lines. `only_sites`: registrable domains to export (None = all). Session cookies get `now + session_ttl` so a login survives a |
+| fn | `import` | `pub fn import(&self, text: &str) -> usize` |  |
+| fn | `cookies_export` | `pub fn cookies_export(only_sites: Option<&[&str]>, session_ttl: u64) -> String` |  |
+| fn | `cookies_import` | `pub fn cookies_import(text: &str) -> usize` |  |
+| fn | `cookies_clear` | `pub fn cookies_clear()` |  |
+| fn | `cookies_clear_host` | `pub fn cookies_clear_host(host: &str)` |  |
+| fn | `cookie_count` | `pub fn cookie_count() -> usize` |  |
+| fn | `cache_clear` | `pub fn cache_clear()` |  |
+| fn | `cache_bytes` | `pub fn cache_bytes() -> usize` |  |
+| struct | `Request` | `pub struct Request` |  |
+| fn | `get` | `pub fn get(url: &str) -> Self` |  |
+| fn | `sub` | `pub fn sub(url: &str, page: &str) -> Self` |  |
+| fn | `post_form` | `pub fn post_form(url: &str, fields: &[(String, String)], page: Option<&str>) -> Self` |  |
+| fn | `post` | `pub fn post(url: &str, content_type: &str, body: Vec<u8>, page: Option<&str>) -> Self` |  |
+| fn | `send` | `pub fn send(r: &Request) -> Result<Response, String>` | Full pipeline: data: URLs, blocklist, private-network guard, HSTS / HTTPS-first, cache, retries. |
+| fn | `fetch` | `pub fn fetch(url: &str) -> Result<Response, String>` | Main page: any status is returned (error pages are rendered). |
+| fn | `fetch_max` | `pub fn fetch_max(url: &str, max: u64) -> Result<Response, String>` |  |
+| fn | `fetch_range` | `pub fn fetch_range(url: &str, start: u64, end: Option<u64>, max: u64) -> Result<Response, String>` | Byte range (media). `end` inclusive. Server may answer 206 or 200. |
+| fn | `fetch_sub` | `pub fn fetch_sub(url: &str) -> Result<Response, String>` | Subresource (CSS/img/js): short timeout, 2xx only, cached, tracker-blocked. |
+| fn | `fetch_sub_page` | `pub fn fetch_sub_page(url: &str, page: &str) -> Result<Response, String>` |  |
+| fn | `post_form` | `pub fn post_form(url: &str, fields: &[(String, String)], page: Option<&str>) -> Result<Response, String>` |  |
+| fn | `par_map` | `pub fn par_map<T: Send>(urls: &[String], f: impl Fn(Response) -> Option<T> + Sync) -> Vec<Option<T>>` | Parallel subresource fetch (order preserved). Uses the current page for blocking/referrer. |
+| fn | `par_map_page` | `pub fn par_map_page<T: Send>(urls: &[String], page: &str, f: impl Fn(Response) -> Option<T> + Sync) -> Vec<Option<T>>` |  |
+| fn | `clear_all` | `pub fn clear_all()` | Forget everything held in RAM (call on exit or "clear browsing data"). |
+| fn | `sniff_mime` | `pub fn sniff_mime(body: &[u8], declared: &str) -> String` | Fix wrong/missing Content-Type by magic bytes. |
+| fn | `decode` | `pub fn decode(body: &[u8], content_type: &str) -> String` | Decode using BOM, Content-Type charset, then <meta charset> sniff, else UTF-8. |
+| fn | `resolve` | `pub fn resolve(base: &str, href: &str) -> Option<String>` |  |
+
+Tests: `cache_fresh_and_stale`, `cookie_basic_and_security`, `cookie_export_import_roundtrip`, `cookie_rejections_and_delete`, `data_urls_and_base64`, `domains`, `hsts_rules`, `http_dates`, `par_map_keeps_order`, `private_hosts`, `referrer_policy`, `sniff_and_decode`, `third_party_cookie_blocking`
+
+### `src/dro_paint.rs`
+
+Sparrow paint: layout items -> RGBA pixels (tiny-skia + built-in 5x7 bitmap font).
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| fn | `advance` | `pub fn advance(size: f32) -> f32` | Horizontal advance of one character cell. `dro_layout` uses this for measuring, so it must stay in sync with how `text()` places glyphs. |
+| fn | `decode_image` | `pub fn decode_image(bytes: &[u8]) -> Result<Pixmap, String>` | Decode PNG/JPEG/GIF into a premultiplied pixmap. Oversized images are rejected before decoding. |
+| fn | `paint` | `pub fn paint(l: &Layout, w: u32, h: u32, scroll: f32, images: &HashMap<String, Pixmap>) -> Result<Vec<u8>, String>` |  |
+
+### `src/engine_host.rs`
+
+Runs the engine on its OWN thread with a big stack and talks to it through messages.
+- `EngineHost::call(closure)` : run any code on the engine thread (panics are caught -> "Page crashed, reload?").
+- `Cmd` / `Reply` + `execute()` : the full engine API as plain data, with a binary codec (`to_bytes/from_bytes`),
+so the same protocol can later run over a pipe to a child process (real crash isolation).
+Limits: a big stack makes stack overflow far less likely but cannot make it impossible; only a separate
+process survives a hard overflow / OOM. Panics are fully handled.
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| const | `CRASH_MSG` | `pub const CRASH_MSG: &str = "Page crashed, reload?"` |  |
+| const | `DEFAULT_STACK` | `pub const DEFAULT_STACK: usize = 256 * 1024 * 1024; // address space reserve; pages are committed lazily` |  |
+| enum | `Cmd` | `pub enum Cmd` |  |
+| enum | `Reply` | `pub enum Reply` |  |
+| fn | `execute` | `pub fn execute(e: &mut SparrowEngine, c: Cmd) -> Reply` | Execute one command on an engine. Never panics outward (engine methods are already guarded). |
+| fn | `to_bytes` | `pub fn to_bytes(&self) -> Vec<u8>` |  |
+| fn | `from_bytes` | `pub fn from_bytes(b: &[u8]) -> Result<Cmd, String>` |  |
+| fn | `to_bytes` | `pub fn to_bytes(&self) -> Vec<u8>` |  |
+| fn | `from_bytes` | `pub fn from_bytes(b: &[u8]) -> Result<Reply, String>` |  |
+| struct | `EngineHost` | `pub struct EngineHost` |  |
+| fn | `spawn` | `pub fn spawn() -> Result<Self, String>` |  |
+| fn | `spawn_with_stack` | `pub fn spawn_with_stack(stack: usize) -> Result<Self, String>` | Tries `stack` bytes, then smaller stacks if the OS refuses (32-bit, low memory). |
+| fn | `call` | `pub fn call<R: Send + 'static>(&self, f: impl FnOnce(&mut SparrowEngine) -> R + Send + 'static) -> Result<R, String>` |  |
+| fn | `call_timeout` | `pub fn call_timeout<R: Send + 'static>(&self, f: impl FnOnce(&mut SparrowEngine) -> R + Send + 'static, timeout: Option<Duration>) -> Result<R, Str...` | With a timeout the call returns "engine busy" but the engine keeps working on the job. |
+| fn | `exec` | `pub fn exec(&self, c: Cmd) -> Reply` | Run one protocol command. |
+| fn | `is_alive` | `pub fn is_alive(&self) -> bool` |  |
+| struct | `RemoteEngine` | `pub struct RemoteEngine` | Same method names/signatures as `SparrowEngine`, but every call runs on the engine thread. `ffi.rs` only needs `SparrowEngine` -> `RemoteEng |
+| fn | `new` | `pub fn new() -> Self` |  |
+| fn | `is_crashed` | `pub fn is_crashed(&self) -> bool` |  |
+| fn | `url` | `pub fn url(&self) -> &str` |  |
+| fn | `title` | `pub fn title(&self) -> &str` |  |
+| fn | `viewport` | `pub fn viewport(&self) -> (u32, u32)` |  |
+| fn | `recover` | `pub fn recover(&mut self)` |  |
+| fn | `load_url` | `pub fn load_url(&mut self, u: &str) -> Result<(), String>` |  |
+| fn | `load_html` | `pub fn load_html(&mut self, html: &str, base: &str) -> Result<(), String>` |  |
+| fn | `reload` | `pub fn reload(&mut self) -> Result<(), String>` |  |
+| fn | `resize` | `pub fn resize(&mut self, w: u32, h: u32) -> Result<(), String>` |  |
+| fn | `render` | `pub fn render(&mut self) -> Result<Vec<u8>, String>` |  |
+| fn | `eval_js` | `pub fn eval_js(&mut self, code: &str) -> Result<String, String>` |  |
+| fn | `take_logs` | `pub fn take_logs(&mut self) -> Vec<String>` |  |
+| fn | `take_navigation` | `pub fn take_navigation(&mut self) -> Option<String>` |  |
+| fn | `hit_test` | `pub fn hit_test(&self, x: f32, y: f32) -> Option<String>` |  |
+| fn | `page_text` | `pub fn page_text(&self) -> String` |  |
+| fn | `scroll_by` | `pub fn scroll_by(&mut self, dy: f32) -> Result<f32, String>` |  |
+| fn | `fire_event` | `pub fn fire_event(&mut self, id: &str, ev: &str) -> Result<bool, String>` |  |
+| fn | `run_timers` | `pub fn run_timers(&mut self, ms: u32) -> Result<usize, String>` |  |
+| fn | `find_in_page` | `pub fn find_in_page(&mut self, q: &str) -> Result<Vec<(f32, f32, f32, f32)>, String>` |  |
+| fn | `media_tick` | `pub fn media_tick(&mut self) -> Result<bool, String>` |  |
+| fn | `media_click` | `pub fn media_click(&mut self, x: f32, y: f32) -> bool` |  |
+| fn | `media_key` | `pub fn media_key(&mut self, k: &str) -> bool` |  |
+
+Tests: `bad_input_is_an_error_never_a_panic`, `big_stack_survives_deep_recursion_that_small_stacks_cannot`, `codec_roundtrip_all_commands_and_replies`, `drop_joins_thread`, `host_runs_commands_on_engine_thread`, `panic_inside_job_is_contained_and_engine_recovers`, `remote_engine_is_a_drop_in_with_crash_state`, `timeout_reports_busy_and_host_survives`
+
+### `src/ffi.rs`
+
+C ABI for the shell (Go/cgo, C, C++). All functions are panic-safe: a panic never crosses FFI.
+Strings returned are owned by the handle and valid until the next call on the same handle.
+Build as cdylib (see PATCHES.md). Header: include/sparrow.h
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| struct | `Handle` | `pub struct Handle` |  |
+| fn | `sparrow_create` | `pub extern "C" fn sparrow_create() -> *mut Handle` |  |
+| fn | `sparrow_destroy` | `pub unsafe extern "C" fn sparrow_destroy(p: *mut Handle)` |  |
+| fn | `sparrow_load_url` | `pub unsafe extern "C" fn sparrow_load_url(p: *mut Handle, url: *const c_char) -> c_int` | 0 ok, 1 error (see sparrow_last_error), 2 page crashed (show "Page crashed, reload?", then sparrow_recover). |
+| fn | `sparrow_load_html` | `pub unsafe extern "C" fn sparrow_load_html(p: *mut Handle, html: *const c_char, base: *const c_char) -> c_int` |  |
+| fn | `sparrow_set_viewport` | `pub unsafe extern "C" fn sparrow_set_viewport(p: *mut Handle, w: u32, hh: u32) -> c_int` |  |
+| fn | `sparrow_render` | `pub unsafe extern "C" fn sparrow_render(p: *mut Handle, out_w: *mut u32, out_h: *mut u32) -> *const u8` | Returns pointer to RGBA pixels (w*h*4) or null on error. Valid until next render/destroy. |
+| fn | `sparrow_eval_js` | `pub unsafe extern "C" fn sparrow_eval_js(p: *mut Handle, code: *const c_char) -> *const c_char` | Returns the result string, or null on error (see sparrow_last_error). |
+| fn | `sparrow_last_error` | `pub unsafe extern "C" fn sparrow_last_error(p: *mut Handle) -> *const c_char` |  |
+| fn | `sparrow_title` | `pub unsafe extern "C" fn sparrow_title(p: *mut Handle) -> *const c_char` |  |
+| fn | `sparrow_url` | `pub unsafe extern "C" fn sparrow_url(p: *mut Handle) -> *const c_char` |  |
+| fn | `sparrow_take_logs` | `pub unsafe extern "C" fn sparrow_take_logs(p: *mut Handle) -> *const c_char` | console.log/alert lines since last call, joined by '\n'. |
+| fn | `sparrow_take_navigation` | `pub unsafe extern "C" fn sparrow_take_navigation(p: *mut Handle) -> *const c_char` | URL JS asked to navigate to, or null. |
+| fn | `sparrow_hit_test` | `pub unsafe extern "C" fn sparrow_hit_test(p: *mut Handle, x: f32, y: f32) -> *const c_char` | Link under viewport point (x, y), or null. |
+| fn | `sparrow_scroll_by` | `pub unsafe extern "C" fn sparrow_scroll_by(p: *mut Handle, dy: f32) -> f32` | Returns new scroll_y (or -1.0 on error). |
+| fn | `sparrow_fire_event` | `pub unsafe extern "C" fn sparrow_fire_event(p: *mut Handle, id: *const c_char, ev: *const c_char) -> c_int` |  |
+| fn | `sparrow_run_timers` | `pub unsafe extern "C" fn sparrow_run_timers(p: *mut Handle, ms: u32) -> c_int` | Call every frame with elapsed ms. Returns callbacks run, or -1 on error. |
+| fn | `sparrow_find` | `pub unsafe extern "C" fn sparrow_find(p: *mut Handle, q: *const c_char) -> *const c_char` | "x,y,w,h;x,y,w,h;..." in document coordinates. |
+| fn | `sparrow_page_text` | `pub unsafe extern "C" fn sparrow_page_text(p: *mut Handle) -> *const c_char` |  |
+| fn | `sparrow_is_crashed` | `pub unsafe extern "C" fn sparrow_is_crashed(p: *mut Handle) -> c_int` |  |
+| fn | `sparrow_recover` | `pub unsafe extern "C" fn sparrow_recover(p: *mut Handle)` |  |
+
+### `src/forms.rs`
+
+HTML form submission: collect successful controls (HTML spec 4.10.21), urlencode, build GET/POST request.
+Pure logic over `Dom`; the network call itself is done by `dro_net` (needs a POST helper: see FormRequest).
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| enum | `Method` | `pub enum Method` |  |
+| struct | `FormRequest` | `pub struct FormRequest` |  |
+| fn | `urlencode` | `pub fn urlencode(s: &str) -> String` | application/x-www-form-urlencoded byte serializer. |
+| fn | `urldecode` | `pub fn urldecode(s: &str) -> String` |  |
+| fn | `encode_pairs` | `pub fn encode_pairs(p: &[(String, String)]) -> String` |  |
+| fn | `find_form` | `pub fn find_form(dom: &Dom, node: NodeId) -> Option<NodeId>` | Closest ancestor `<form>` of `node` (or the node itself). |
+| fn | `collect` | `pub fn collect(dom: &Dom, form: NodeId, submitter: Option<NodeId>) -> Vec<(String, String)>` | Successful controls of `form` in tree order. `submitter` is the button that was clicked (if any). |
+| fn | `build_request` | `pub fn build_request(dom: &Dom, form: NodeId, submitter: Option<NodeId>, base: &str) -> Result<FormRequest, String>` | Build the request for submitting `form` (optionally via `submitter`) on a page at `base`. |
+
+Tests: `collects_successful_controls_in_order`, `empty_action_uses_page_url_and_find_form`, `encoding_roundtrip`, `get_replaces_query_and_drops_fragment`, `post_and_overrides_and_errors`, `select_defaults_to_first_option`
+
+### `src/input.rs`
+
+Text editing model for <input>/<textarea>: caret, selection, typing, delete, word/line movement,
+clipboard, undo/redo, mouse mapping. DOM-independent: the engine owns one `TextField` per focused control.
+Caret moves by grapheme-ish clusters (Bengali/Devanagari vowel signs + virama conjuncts stay together);
+Backspace/Delete remove one code point (like most editors).
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| enum | `Key` | `pub enum Key` |  |
+| struct | `Mods` | `pub struct Mods` |  |
+| trait | `Clipboard` | `pub trait Clipboard` |  |
+| struct | `MemoryClipboard` | `pub struct MemoryClipboard(pub String)` |  |
+| enum | `Outcome` | `pub enum Outcome` |  |
+| struct | `TextField` | `pub struct TextField` |  |
+| fn | `new` | `pub fn new(multiline: bool) -> Self` |  |
+| fn | `with_text` | `pub fn with_text(multiline: bool, t: &str) -> Self` |  |
+| fn | `set_text` | `pub fn set_text(&mut self, t: &str)` | Replace the whole value (programmatic; clears undo history). Caret goes to the end. |
+| fn | `text` | `pub fn text(&self) -> String` |  |
+| fn | `display_text` | `pub fn display_text(&self) -> String` | What to draw (password fields show '*'). |
+| fn | `len` | `pub fn len(&self) -> usize` |  |
+| fn | `is_empty` | `pub fn is_empty(&self) -> bool` |  |
+| fn | `caret` | `pub fn caret(&self) -> usize` |  |
+| fn | `selection` | `pub fn selection(&self) -> Option<(usize, usize)>` |  |
+| fn | `selected_text` | `pub fn selected_text(&self) -> String` |  |
+| fn | `lines` | `pub fn lines(&self) -> Vec<(usize, usize)>` |  |
+| fn | `undo` | `pub fn undo(&mut self) -> bool` |  |
+| fn | `redo` | `pub fn redo(&mut self) -> bool` |  |
+| fn | `insert_str` | `pub fn insert_str(&mut self, s: &str) -> bool` | Insert text at the caret (typing, paste, IME commit). Respects `max_len` and single-line rules. |
+| fn | `select_all` | `pub fn select_all(&mut self)` |  |
+| fn | `set_caret` | `pub fn set_caret(&mut self, idx: usize, extend: bool)` | Set caret from the mouse (`extend` = shift/drag). |
+| fn | `select_word` | `pub fn select_word(&mut self, idx: usize)` | Double-click: select the word under `idx`. |
+| fn | `handle_key` | `pub fn handle_key(&mut self, key: Key, m: Mods, clip: &mut dyn Clipboard) -> Outcome` |  |
+| fn | `x_of` | `pub fn x_of(&self, idx: usize, measure: &dyn Fn(&str) -> f32) -> f32` | X offset of caret index `idx` inside its line, using the shaper's `measure`. |
+| fn | `index_at` | `pub fn index_at(&self, x: f32, line: usize, measure: &dyn Fn(&str) -> f32) -> usize` | Nearest caret index for a click at `x` on line `line` (0-based). |
+| fn | `line_of` | `pub fn line_of(&self, idx: usize) -> usize` |  |
+
+Tests: `bangla_clusters_move_together_backspace_by_codepoint`, `clipboard_cut_copy_paste_and_single_line_filter`, `mouse_mapping_and_password`, `multiline_up_down_keeps_column_and_enter`, `selection_replace_and_shift_arrows`, `single_line_enter_submits_and_max_len`, `typing_backspace_delete`, `undo_redo_coalesces_typing`, `word_movement_and_delete`
+
+### `src/js_engine.rs`
+
+JS engine abstraction: DOM/bridge code should depend on `JsEngine`, never on boa directly.
+Swap Boa -> QuickJS -> V8 by adding one `impl JsEngine` and one arm in `create()`.
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| trait | `JsEngine` | `pub trait JsEngine` |  |
+| struct | `NullJs` | `pub struct NullJs` | JavaScript disabled (settings: "JS off"). |
+| fn | `create` | `pub fn create(kind: &str) -> Result<Box<dyn JsEngine>, String>` | kind: "boa" (default) \| "off". Add "quickjs" / "v8" here later. |
+
+Tests: `boa_evaluates`, `off_engine_refuses`, `unknown_engine_errors`
+
+### `src/lib.rs`
+
+Sparrow Engine: Rust browser engine embedded in the Sparrow shell.
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| mod | `dro_charset` | `pub mod dro_charset` |  |
+| mod | `dro_css` | `pub mod dro_css` |  |
+| mod | `dro_css_ext` | `pub mod dro_css_ext` |  |
+| mod | `dro_dom` | `pub mod dro_dom` |  |
+| mod | `dro_dom_js` | `pub mod dro_dom_js` |  |
+| mod | `dro_html` | `pub mod dro_html` |  |
+| mod | `dro_layout` | `pub mod dro_layout` |  |
+| mod | `dro_paint` | `pub mod dro_paint` |  |
+| mod | `dro_js` | `pub mod dro_js` |  |
+| mod | `js_engine` | `pub mod js_engine` |  |
+| mod | `dro_blocklist` | `pub mod dro_blocklist` |  |
+| mod | `dro_font` | `pub mod dro_font` |  |
+| mod | `dro_media` | `pub mod dro_media` |  |
+| mod | `dro_media_ui` | `pub mod dro_media_ui` |  |
+| mod | `dro_net` | `pub mod dro_net` |  |
+| mod | `browser` | `pub mod browser` |  |
+| mod | `ffi` | `pub mod ffi` |  |
+| mod | `safety` | `pub mod safety` |  |
+| mod | `sparrow_engine` | `pub mod sparrow_engine` |  |
+| fn | `create_engine` | `pub fn create_engine() -> SparrowEngine` |  |
+
+### `src/safety.rs`
+
+Crash/hang protection helpers (std only).
+NOTE: a real stack overflow or OOM still kills the process; big stacks make it rare,
+process isolation (later) removes it.
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| fn | `log` | `pub fn log(msg: impl Into<String>)` | RAM-only ring log (never touches disk). |
+| fn | `recent_logs` | `pub fn recent_logs() -> Vec<String>` |  |
+| fn | `clear_logs` | `pub fn clear_logs()` |  |
+| fn | `install_panic_hook` | `pub fn install_panic_hook()` | Panics are written to the RAM log instead of stderr/disk. |
+| fn | `run_guarded` | `pub fn run_guarded<T>(label: &str, f: impl FnOnce() -> T + UnwindSafe) -> Result<T, String>` | Run `f`, turning a panic into `Err`. |
+| fn | `run_big_stack` | `pub fn run_big_stack<T: Send + 'static>(stack_mb: usize, f: impl FnOnce() -> T + Send + 'static) -> Result<T, String>` | Run `f` on a fresh thread with a large stack (deep DOM/CSS recursion). |
+| fn | `run_with_timeout` | `pub fn run_with_timeout<T: Send + 'static>(ms: u64, stack_mb: usize, f: impl FnOnce() -> T + Send + 'static) -> Result<T, String>` | Like `run_big_stack` but gives up after `ms`. A stuck thread cannot be killed in safe Rust: it is abandoned; after MAX_ABANDONED stuck threa |
+| fn | `abandoned_workers` | `pub fn abandoned_workers() -> usize` |  |
+| struct | `Deadline` | `pub struct Deadline` | Cooperative deadline for long Rust loops (layout, parsing): call `expired()` every N iterations. |
+| fn | `after_ms` | `pub fn after_ms(ms: u64) -> Self` |  |
+| fn | `expired` | `pub fn expired(&self) -> bool` |  |
+| fn | `check` | `pub fn check(&self, what: &str) -> Result<(), String>` |  |
+| mod | `limits` | `pub mod limits` | Hard limits used by the engine (keep in one place). |
+| const | `MAX_DOM_NODES` | `pub const MAX_DOM_NODES: usize = 200_000` |  |
+| const | `MAX_DOM_DEPTH` | `pub const MAX_DOM_DEPTH: usize = 512` |  |
+| const | `MAX_CSS_BYTES` | `pub const MAX_CSS_BYTES: usize = 2 * 1024 * 1024` |  |
+| const | `MAX_SCRIPT_BYTES` | `pub const MAX_SCRIPT_BYTES: usize = 2 * 1024 * 1024` |  |
+| const | `MAX_PIXELS` | `pub const MAX_PIXELS: u64 = 16_000_000; // 4000x4000 RGBA = 64 MB` |  |
+| const | `MAX_SIDE` | `pub const MAX_SIDE: u32 = 16_384` |  |
+| fn | `viewport_ok` | `pub fn viewport_ok(w: u32, h: u32) -> Result<(), String>` |  |
+
+Tests: `big_stack_deep_recursion`, `deadline_and_limits`, `guarded_catches_panic`, `log_ring_is_bounded`, `timeout_returns`
+
+### `src/sparrow_engine.rs`
+
+SparrowEngine: one page = DOM + styles + layout + JS + media. Everything is RAM-only.
+Child modules: `bridge` (page install, JS DOM, events, timers, find) and `media_bridge` (<video>/<audio>).
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| const | `CRASH_MSG` | `pub const CRASH_MSG: &str = "Page crashed, reload?"` |  |
+| struct | `SparrowEngine` | `pub struct SparrowEngine` |  |
+| fn | `new` | `pub fn new() -> Self` |  |
+| fn | `is_crashed` | `pub fn is_crashed(&self) -> bool` |  |
+| fn | `recover` | `pub fn recover(&mut self)` |  |
+| fn | `url` | `pub fn url(&self) -> &str` |  |
+| fn | `title` | `pub fn title(&self) -> &str` |  |
+| fn | `status` | `pub fn status(&self) -> u16` | HTTP status of the last main-page load (0 = none). |
+| fn | `viewport` | `pub fn viewport(&self) -> (u32, u32)` |  |
+| fn | `set_viewport` | `pub fn set_viewport(&mut self, w: u32, h: u32)` | Re-styles for the new size (media queries, vw/vh). |
+| fn | `net_stats` | `pub fn net_stats(&self) -> dro_net::Stats` | Network counters (requests, cache hits, blocked trackers, ...). |
+| fn | `clear_session_data` | `pub fn clear_session_data(&mut self)` | "Clear browsing data": cookies, HTTP cache, HSTS (all RAM) + this page's images/JS storage. |
+| fn | `reload` | `pub fn reload(&mut self) -> Result<(), String>` |  |
+| fn | `load_url` | `pub fn load_url(&mut self, input: &str) -> Result<(), String>` |  |
+| fn | `load_html` | `pub fn load_html(&mut self, html: &str, base: &str) -> Result<(), String>` | Load raw HTML (no network for the page itself); sub-resources resolve against `base`. |
+| fn | `render` | `pub fn render(&mut self) -> Result<Vec<u8>, String>` | Returns RGBA pixels (viewport width * height * 4); media control bars are overlaid. |
+| fn | `eval_js` | `pub fn eval_js(&mut self, code: &str) -> Result<String, String>` |  |
+| fn | `take_logs` | `pub fn take_logs(&mut self) -> Vec<String>` | console.log / alert output since last call |
+| fn | `scroll_by` | `pub fn scroll_by(&mut self, dy: f32) -> Result<f32, String>` |  |
+| fn | `hit_test` | `pub fn hit_test(&self, x: f32, y: f32) -> Option<String>` | Click at viewport (x, y). Returns resolved link URL if a link was hit. (Shell: call `media_click` first; if it returns true, skip this.) |
+
+Tests: `blank_engine_state`, `escapes_html`, `load_html_sets_title_and_renders`, `recover_keeps_viewport_and_url`, `same_doc_needs_loaded_page`
+
+### `src/sparrow_engine/bridge.rs`
+
+Child module of `sparrow_engine` (so it can touch private fields).
+Adds: install_page (JS DOM + charset + css preprocessor), restyle, events, timers,
+find-in-page, page text, DOM dump. Does not change existing public API.
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| fn | `restyle` | `pub(super) fn restyle(&mut self)` | Rebuild computed styles from UA + fetched <link> CSS + current <style> elements. Called after load, after viewport change (media queries/vw/ |
+| fn | `install_page` | `pub(super) fn install_page(&mut self, html: &str, base: &str) -> Result<(), String>` | Full page install. Replaces the old `install` (call sites: load_url, load_html). |
+| fn | `apply_js` | `pub(super) fn apply_js(&mut self) -> Result<(), String>` | Pull navigation + DOM changes out of JS and rebuild styles if needed. |
+| fn | `take_navigation` | `pub fn take_navigation(&mut self) -> Option<String>` | URL requested by page JS (link click handled in JS, `location.href=`). Shell should `load_url` it. |
+| fn | `fire_event` | `pub fn fire_event(&mut self, element_id: &str, event: &str) -> Result<bool, String>` | Dispatch a DOM event (e.g. "click") on the element whose `id` attribute is `element_id`. |
+| fn | `run_timers` | `pub fn run_timers(&mut self, elapsed_ms: u32) -> Result<usize, String>` | Advance JS timers by `elapsed_ms` (call ~every frame / 16 ms). Returns number of callbacks run. |
+| fn | `resize` | `pub fn resize(&mut self, w: u32, h: u32) -> Result<(), String>` | Re-run styling for a new viewport (media queries, vw/vh). Replaces the old `set_viewport` body. |
+| fn | `document_height` | `pub fn document_height(&mut self) -> Result<f32, String>` |  |
+| fn | `scroll_y` | `pub fn scroll_y(&self) -> f32` |  |
+| fn | `find_in_page` | `pub fn find_in_page(&mut self, query: &str) -> Result<Vec<(f32, f32, f32, f32)>, String>` | Find-in-page: rectangles `(x, y, w, h)` in DOCUMENT coordinates (subtract `scroll_y()` to draw). Multi-word queries match consecutive words. |
+| fn | `page_text` | `pub fn page_text(&self) -> String` | Visible text of the page (reader-mode style): scripts/styles skipped, blocks separated by newlines. |
+| fn | `dump_dom` | `pub fn dump_dom(&self) -> String` | Debug tree dump (devtools-lite). Depth capped at 40, text truncated. |
+
+### `src/sparrow_engine/media_bridge.rs`
+
+Child module of `sparrow_engine`: connects <video>/<audio> elements to `dro_media::Media`.
+Fetch happens on a worker thread (bytes only); `Media` (cpal stream is !Send) is built on the engine thread.
+Video frames are injected into `self.images` under the key "media:<index>", so the existing
+image painter draws them; the control bar is overlaid in `overlay_media`.
+
+| Kind | Name | Signature | Doc |
+|---|---|---|---|
+| struct | `Slot` | `pub(super) struct Slot` |  |
+| fn | `setup_media` | `pub(super) fn setup_media(&mut self, base: &str)` | Create one slot per <video>/<audio> (document order == JS `mediaList()` order) and start fetching. |
+| fn | `media_tick` | `pub fn media_tick(&mut self) -> Result<bool, String>` | Drive media: finish downloads, run JS commands, upload frames, fire events. Call every frame (~16 ms). Returns true when the picture changed |
+| fn | `overlay_media` | `pub(super) fn overlay_media(&mut self, px: Vec<u8>) -> Vec<u8>` | Draw control bars on top of a rendered frame (viewport pixels). No media -> returns input untouched. |
+| fn | `media_click` | `pub fn media_click(&mut self, x: f32, y: f32) -> bool` | Click in viewport coordinates. Returns true if a media control handled it (then skip link hit-test). |
+| fn | `media_key` | `pub fn media_key(&mut self, key: &str) -> bool` | Keyboard for the first loaded media: " " play/pause, ArrowLeft/Right +-5s, ArrowUp/Down volume. |
+
+### `src/dom_bootstrap.js`
+
+JS-side DOM shim loaded into Boa. Globals it installs:
+
+- `CustomEvent`
+- `Element`
+- `Event`
+- `HTMLElement`
+- `IntersectionObserver`
+- `MutationObserver`
+- `Node`
+- `ResizeObserver`
+- `Text`
+- `XMLHttpRequest`
+- `__DOM`
+- `__fire`
+- `__fireOn`
+- `__isDirty`
+- `__mediaCmds`
+- `__mediaEvent`
+- `__mediaState`
+- `__runTimers`
+- `__serialize`
+- `__takeNav`
+- `_ls`
+- `addEventListener`
+- `alert`
+- `blur`
+- `cancelAnimationFrame`
+- `clearInterval`
+- `clearTimeout`
+- `confirm`
+- `devicePixelRatio`
+- `dispatchEvent`
+- `document`
+- `fetch`
+- `focus`
+- `getComputedStyle`
+- `globalThis`
+- `history`
+- `innerHeight`
+- `innerWidth`
+- `localStorage`
+- `location`
+- `matchMedia`
+- `navigator`
+- `open`
+- `outerHeight`
+- `outerWidth`
+- `parent`
+- `parentNode`
+- `performance`
+- `prompt`
+- `queueMicrotask`
+- `removeEventListener`
+- `requestAnimationFrame`
+- `scroll`
+- `scrollBy`
+- `scrollTo`
+- `self`
+- `sessionStorage`
+- `setInterval`
+- `setTimeout`
+- `top`
+- `window`
 
 ---
 
-## 7. Feature reference for AI assistants
+## C ABI reference
 
-### 7.1 HTML elements and default behaviour
+Header: `include/sparrow.h`. Return codes: `0` ok, `1` error (see `sparrow_last_error`), `2` page crashed.
 
-| Element(s) | Behaviour |
-|---|---|
-| `html body div p h1–h6 ul ol li section article header footer nav main aside form table thead tbody tfoot pre blockquote figure fieldset dl dt dd address center details summary` | `display:block` |
-| `tr` | flex row; `td`, `th` = block, `flex-grow:1`, padding 2px (cheap table support, columns do not align across rows) |
-| `a` | inline, blue, underlined; `href` makes words clickable (`hit_test`) |
-| `b strong th` | bold |
-| `img` | inline-block, loaded from `src` (png/jpeg/gif) |
-| `input` (text/password/checkbox/radio/submit/button/reset/hidden) | see §2.5; not interactive yet |
-| `button` | inline-block with border and background |
-| `hr` | 1px grey line |
-| `br` | forced line break |
-| `head script style title meta link template noscript option datalist svg canvas audio video iframe` | `display:none` |
-
-### 7.2 Selectors supported
-
-`tag`, `*`, `.a`, `.a.b`, `#id`, `tag.a#id`, `A B` (descendant), `A > B` (child), comma lists.
-Anything containing other characters (`:`, `[`, `+`, `~`, `@`) is **dropped silently** (the rule is ignored).
-
-### 7.3 CSS properties supported
-
-| Property | Values / notes |
-|---|---|
-| `display` | `none`, `block`, `list-item`, `table`, `flow-root` → block; `flex`, `grid`, `table-row` → flex (grid is faked as flex); `inline-block`, `inline-flex`, … → inline-block; else inline |
-| `color` | `#rgb`, `#rrggbb`, `#rrggbbaa` (alpha ignored), `rgb()/rgba()`, ~20 named colors |
-| `background`, `background-color` | color only (gradients/images ignored); `none/transparent` clears |
-| `font-size` | px, em, rem, pt, %, keywords (small…xx-large, smaller, larger); min 6px |
-| `font-weight` | `bold`, `bolder`, ≥600 |
-| `text-decoration` | `underline` only |
-| `text-align` | left, center, right (end) |
-| `line-height` | number, px, `normal` (default 1.3) |
-| `margin`, `margin-*` | 1–4 values; px/em/rem/pt; `auto` only for left/right |
-| `padding`, `padding-*` | 1–4 values |
-| `width`, `max-width` | px, em, rem, %, auto |
-| `height` | px |
-| `border` | width + color (style keyword ignored), `none`; `border-width`, `border-color` (single value for all sides) |
-| `flex-direction` | row / column |
-| `flex`, `flex-grow` | first number only |
-| `gap`, `column-gap`, `row-gap` | one value |
-| `justify-content` | flex-start, center, flex-end, space-between, space-around/evenly |
-| `align-items` | stretch, center, flex-start, flex-end |
-
-Everything else is parsed and ignored.
-
-### 7.4 Public data returned to the shell
-
-- `render()` → `Vec<u8>` RGBA8, **premultiplied = straight** because the canvas is fully opaque; row-major, top-left origin, length `w*h*4`.
-- `take_logs()` → `Vec<String>` (console output, `alert: <msg>` lines).
-- `hit_test(x,y)` → absolute URL string if a link (text or image) is under the point (viewport coordinates; scroll is applied inside).
-- `title()`, `url()` → strings; `url()` is the **final** URL after redirects.
-
-### 7.5 How to add a new CSS property (worked example: `opacity`)
-
-1. Add field `opacity: f32` to `Style` and to `Style::root()` (non-inherited → default 1.0).
-2. Parse it in `apply()` in `dro_css.rs` (`"opacity" => …`).
-3. Carry it into `Paint::Box/Word/Image` in `dro_layout.rs` (`box_paint`, `words`, `image`).
-4. Apply it in `dro_paint.rs` (e.g. multiply alpha before `fill_rect`).
-5. Add a test in `dro_css.rs` and update §7.3 here.
-
-### 7.6 How to add a new HTML element behaviour
-
-1. Default display → add to `UA` string in `dro_css.rs`.
-2. Special content (like `input`) → add a branch in `block()` in `dro_layout.rs`.
-3. New drawable → add a `Paint` variant, emit it in layout, draw it in `dro_paint::paint`.
-
-### 7.7 How to expose a new JS function
-
-- Plain function: write `fn f(this:&JsValue, args:&[JsValue], ctx:&mut Context<'_>) -> JsResult<JsValue>` and register with `ctx.register_global_builtin_callable(name, argc, NativeFunction::from_fn_ptr(f))` in `JsRuntime::new`.
-- Anything that needs engine state (DOM!) cannot use a plain fn pointer; use `NativeFunction::from_copy_closure_with_captures` with a traced capture holding an `Rc<RefCell<Dom>>`-like handle (Phase 3 design task: the DOM must become shareable between engine and JS).
+| Function | Signature | Doc |
+|---|---|---|
+| `sparrow_create` | `() -> *mut Handle` |  |
+| `sparrow_destroy` | `(p: *mut Handle) -> ()` |  |
+| `sparrow_load_url` | `(p: *mut Handle, url: *const c_char) -> c_int` | 0 ok, 1 error (see sparrow_last_error), 2 page crashed (show "Page crashed, reload?", then sparrow_recover). |
+| `sparrow_load_html` | `(p: *mut Handle, html: *const c_char, base: *const c_char) -> c_int` |  |
+| `sparrow_set_viewport` | `(p: *mut Handle, w: u32, hh: u32) -> c_int` |  |
+| `sparrow_render` | `(p: *mut Handle, out_w: *mut u32, out_h: *mut u32) -> *const u8` | Returns pointer to RGBA pixels (w*h*4) or null on error. Valid until next render/destroy. |
+| `sparrow_eval_js` | `(p: *mut Handle, code: *const c_char) -> *const c_char` | Returns the result string, or null on error (see sparrow_last_error). |
+| `sparrow_last_error` | `(p: *mut Handle) -> *const c_char` |  |
+| `sparrow_title` | `(p: *mut Handle) -> *const c_char` |  |
+| `sparrow_url` | `(p: *mut Handle) -> *const c_char` |  |
+| `sparrow_take_logs` | `(p: *mut Handle) -> *const c_char` | console.log/alert lines since last call, joined by '\n'. |
+| `sparrow_take_navigation` | `(p: *mut Handle) -> *const c_char` | URL JS asked to navigate to, or null. |
+| `sparrow_hit_test` | `(p: *mut Handle, x: f32, y: f32) -> *const c_char` | Link under viewport point (x, y), or null. |
+| `sparrow_scroll_by` | `(p: *mut Handle, dy: f32) -> f32` | Returns new scroll_y (or -1.0 on error). |
+| `sparrow_fire_event` | `(p: *mut Handle, id: *const c_char, ev: *const c_char) -> c_int` |  |
+| `sparrow_run_timers` | `(p: *mut Handle, ms: u32) -> c_int` | Call every frame with elapsed ms. Returns callbacks run, or -1 on error. |
+| `sparrow_find` | `(p: *mut Handle, q: *const c_char) -> *const c_char` | "x,y,w,h;x,y,w,h;..." in document coordinates. |
+| `sparrow_page_text` | `(p: *mut Handle) -> *const c_char` |  |
+| `sparrow_is_crashed` | `(p: *mut Handle) -> c_int` |  |
+| `sparrow_recover` | `(p: *mut Handle) -> ()` |  |
 
 ---
 
-## 8. Public API contract
+## Shell integration (Go/cgo)
 
-```rust
-// lib.rs
-pub fn create_engine() -> SparrowEngine;
+1. Build the engine as a C library:
+   - `cargo build --release --target x86_64-pc-windows-gnu` (MinGW, same toolchain as the Sparrow shell)
+   - outputs `sparrow_engine.dll` (+ `libsparrow_engine.dll.a` import lib). Copy next to `sparrow.h`.
+2. Threading: **one engine = one OS thread.** Call every function of a handle from the same worker goroutine
+   (`runtime.LockOSThread()`), never from the UI thread: `load_url` blocks on the network.
+3. Frame loop: `run_timers(16)` -> `take_navigation()` -> `render()` -> blit RGBA to the WebView/canvas.
+4. Crash UI: any call returning `2` (or `is_crashed()==1`) -> show "Page crashed, reload?"; on click `sparrow_recover()` then `sparrow_load_url(url)`.
 
-impl SparrowEngine {
-    pub fn new() -> Self;
-    pub fn load_url(&mut self, url: &str) -> Result<(), String>;
-    pub fn load_html(&mut self, html: &str, base_url: &str) -> Result<(), String>;
-    pub fn render(&mut self) -> Result<Vec<u8>, String>;          // RGBA, viewport size
-    pub fn eval_js(&mut self, code: &str) -> Result<String, String>;
-    pub fn take_logs(&mut self) -> Vec<String>;
-    pub fn set_viewport(&mut self, w: u32, h: u32);
-    pub fn viewport(&self) -> (u32, u32);
-    pub fn scroll_by(&mut self, dy: f32) -> Result<f32, String>;  // returns new scroll_y
-    pub fn hit_test(&self, x: f32, y: f32) -> Option<String>;
-    pub fn reload(&mut self) -> Result<(), String>;
-    pub fn recover(&mut self);
-    pub fn is_crashed(&self) -> bool;
-    pub fn url(&self) -> &str;
-    pub fn title(&self) -> &str;
+```go
+package sparrow
+
+/*
+#cgo windows LDFLAGS: -L${SRCDIR}/lib -lsparrow_engine
+#include <stdlib.h>
+#include "sparrow.h"
+*/
+import "C"
+import (
+	"errors"
+	"unsafe"
+)
+
+var ErrCrashed = errors.New("Page crashed, reload?")
+
+type Engine struct{ h *C.SparrowHandle }
+
+func New() *Engine  { return &Engine{h: C.sparrow_create()} }
+func (e *Engine) Close() { C.sparrow_destroy(e.h) }
+
+func (e *Engine) lastErr() error { return errors.New(C.GoString(C.sparrow_last_error(e.h))) }
+
+func (e *Engine) Load(url string) error {
+	cs := C.CString(url)
+	defer C.free(unsafe.Pointer(cs))
+	switch C.sparrow_load_url(e.h, cs) {
+	case 0:
+		return nil
+	case 2:
+		return ErrCrashed
+	}
+	return e.lastErr()
 }
 
-// browser/
-omnibox::resolve(&str) -> String
-Tabs::{new, open, close, switch, list, active, navigate, go_back, go_forward}
-History::{open, add, search, clear}
-Bookmarks::{open, add, remove, contains, list}
-```
+func (e *Engine) Resize(w, h uint32) { C.sparrow_set_viewport(e.h, C.uint32_t(w), C.uint32_t(h)) }
 
-Shell usage:
-
-```rust
-let mut engine = sparrow_engine::create_engine();
-engine.set_viewport(1280, 720);
-match engine.load_url("https://example.com").and_then(|_| engine.render()) {
-    Ok(rgba) => blit(rgba),
-    Err(msg) if msg == "Page crashed, reload?" => { show_crash_page(); /* on click: */ engine.recover(); }
-    Err(msg) => show_error(msg),
+// Render returns a copy of the RGBA frame.
+func (e *Engine) Render() ([]byte, int, int, error) {
+	var w, h C.uint32_t
+	p := C.sparrow_render(e.h, &w, &h)
+	if p == nil {
+		if C.sparrow_is_crashed(e.h) == 1 {
+			return nil, 0, 0, ErrCrashed
+		}
+		return nil, 0, 0, e.lastErr()
+	}
+	return C.GoBytes(unsafe.Pointer(p), C.int(w*h*4)), int(w), int(h), nil
 }
-let _ = engine.eval_js("alert(1)");
-for line in engine.take_logs() { /* "alert: 1" */ }
-```
 
-**API stability rule:** do not rename or change these signatures without updating this README and the shell. Add new methods instead.
+func (e *Engine) Tick(ms uint32) (nav string) {
+	C.sparrow_run_timers(e.h, C.uint32_t(ms))
+	if n := C.sparrow_take_navigation(e.h); n != nil {
+		return C.GoString(n)
+	}
+	return ""
+}
 
----
-
-## 9. Engineering rules (MUST follow)
-
-1. **No `unwrap()`, no `expect()`.** Use `?`, `ok_or`, `map_err`, `unwrap_or`, `let … else`. Return `Result<T, String>`.
-2. **All engine entry points go through `SparrowEngine::guard`** (`catch_unwind`). New public mutating methods must use it.
-3. **Cargo profile must keep `panic = "unwind"`.** With `panic = "abort"`, `catch_unwind` does nothing and Rule 2 is void.
-4. **Direct connection only.** `.no_proxy()`, rustls, no Google/Microsoft endpoints, no telemetry.
-5. **Small binary.** `default-features = false`; every new dependency must justify its size.
-6. **Keep API consistent across files** (names in §4.2/§8). Prefix engine modules with `dro_`.
-7. **Never trust input:** cap sizes, depth, counts; no unbounded recursion on DOM depth (use depth caps or iterative walks).
-8. **Failure of a sub-resource (CSS, image, script) must not fail the page.**
-9. **Indexing (`vec[i]`) can panic** — acceptable inside `guard`, but prefer `.get()` in new code.
-10. Update this README when behaviour or API changes.
+func (e *Engine) Recover() { C.sparrow_recover(e.h) }
 
 ---
 
-## 10. Build, run, test
+## Phase 4 integration guide
 
-```bash
-# toolchain: stable Rust (recent). If cargo is old, see §11.
-cargo build
-cargo build --release          # size-optimised (opt-level z, LTO, strip)
+Phase-4 files are present but **not compiled** until these edits are applied.
+
+| File | Edit |
+|---|---|
+| `src/lib.rs` | add `pub mod dro_cache; pub mod engine_host; pub mod forms; pub mod input;` |
+| `src/browser/mod.rs` | add `pub mod store;` |
+| `Cargo.toml` | delete the `rusqlite` line; add `unicode-bidi = "0.3"` and `unicode-linebreak = "0.1"` |
+| `src/ffi.rs` | `use crate::engine_host::RemoteEngine;`, field `engine: RemoteEngine`, constructor `RemoteEngine::new()` |
+| `src/browser/tabs.rs` | use `RemoteEngine` instead of `SparrowEngine` |
+| `browser/history.rs`, `session.rs`, `bookmark.rs`, `settings.rs` | replace with the RAM-only / `store.rs` versions |
+| `Bookmarks::add/remove`, `Settings::set/remove`, `History::add/clear` | now take `&mut self` |
+
+### Not wired yet
+
+- **Forms:** on submit click call `forms::find_form` then `forms::build_request`; send POST through `dro_net::post_form`.
+- **Cache:** in the fetch path call `Cache::lookup` first; on `Stale` send `If-None-Match` / `If-Modified-Since`; on 304 call `refresh`; on 200 call `store`. One `Cache` per engine. `dro_net` has its own cache today and ignores `Vary`.
+- **Text input:** engine keeps `Option<(NodeId, TextField)>` for the focused control; key events go to `TextField::handle_key`; on `Outcome::Changed` write `text()` back to the `value` attribute and mark layout dirty; draw caret and selection with `x_of` / `index_at` and `dro_font::measure`.
+- **Process isolation:** `Cmd`/`Reply` already have a binary codec; a `ProcessHost` only spawns a child and pipes `Cmd::to_bytes()` / `Reply::from_bytes()` frames with a `u32` length prefix.
+
+### Fixes already applied to Phase 4
+
+- `engine_host.rs`: `RemoteEngine::fin()` keeps the crash flag after `sync()` (the host recovers the engine after a panic, which used to reset the flag and make ffi return 1 instead of 2).
+- `input.rs`: a virama no longer glues a following newline, so the caret cannot jump a line.
+- `forms.rs`: a control inside a form but owned by another form via `form="id"` is no longer submitted.
+
+---
+
+## Storage and privacy model
+
+| Data | Where | Lifetime |
+|---|---|---|
+| Bookmarks | `store.rs` text file (`key<TAB>value`, escaped, atomic tmp+rename) | persistent |
+| Settings | second `store.rs` file (use a different path) | persistent |
+| History | RAM (`history.rs`, max 5000 entries) | process |
+| Recently closed tabs | RAM (`session.rs`, max 25) | process |
+| HTTP cache | RAM (`dro_net` cache; `dro_cache` when wired) | process |
+| Cookies, HSTS | RAM (`RamJar`) | process; export/import available |
+| Page images, JS storage | RAM per engine | page |
+
+Blocklist: third-party trackers are dropped before the request. `Do Not Track` is sent when enabled in `Config`.
+
+---
+
+## Threading and crash model
+
+- One engine = one OS thread. `boa` `Context` is `!Send`, so the engine is created on its own thread and never leaves it.
+- `EngineHost::call(closure)` runs code on that thread; panics are caught, the engine is recovered, the caller gets `"Page crashed, reload?"`.
+- `call_timeout` returns `"engine busy (timeout)"` but the job keeps running; a hung JS loop is not interruptible in Boa.
+- Default stack is 256 MB of reserved address space (committed lazily); falls back to 64 MB then 16 MB.
+- A stack overflow, abort or OOM still kills the process. Only a child process (planned) survives those.
+- `SparrowEngine::guard` also catches panics inside the engine itself and sets `crashed`; every load method auto-recovers a crashed engine.
+- `ffi.rs` wraps every export in `catch_unwind`; no panic crosses the C boundary.
+
+---
+
+## Security model
+
+| Control | State |
+|---|---|
+| Panic isolation | done |
+| Viewport and DOM size limits | done (`safety::limits`) |
+| Script size limit, loop and recursion limits | done |
+| Private-network sub-resource and redirect block | done (not DNS-rebinding safe) |
+| Third-party tracker blocking | done |
+| https-first, HSTS | done |
+| Only classic `<script>` types run | done |
+| Same-origin policy | missing |
+| CORS | missing |
+| CSP | missing |
+| Mixed-content blocking | missing |
+| SameSite cookies | missing |
+| JS sandbox beyond Boa limits | missing |
+| Process isolation | missing |
+
+---
+
+## Testing
+
+```text
+cargo test                 # unit + integration
+cargo test --test smoke    # tests/smoke.rs
+cargo test --test fixes    # tests/fixes.rs
 cargo clippy -- -D warnings
-cargo test
 ```
 
-Suggested harness (not written yet): `examples/dump.rs`
+Phase-4 unit tests (38) were last run against a stub engine with the same signatures, not the real crate.
 
-```rust
-fn main() -> Result<(), String> {
-    let mut e = sparrow_engine::create_engine();
-    e.set_viewport(1024, 768);
-    e.load_html("<h1>Hello</h1><p>World <a href='/x'>link</a></p>", "https://example.test/")?;
-    let rgba = e.render()?;
-    // write PNG with the `image` crate: image::save_buffer("out.png", &rgba, 1024, 768, image::ColorType::Rgba8)
-    let _ = rgba;
-    Ok(())
-}
-```
+### Test index
 
-Test ideas: CSS color parsing, selector matching (descendant/child/specificity), cascade order with `!important`, omnibox rules, DOM operations, layout of a known page against expected word positions, crash guard (inject a deliberate panic behind a `#[cfg(test)]` hook and assert `Err("Page crashed, reload?")`).
+| File | Tests |
+|---|---|
+| `src/browser/history.rs` | add_search_clear, ignores_blank_and_caps |
+| `src/browser/store.rs` | corrupt_lines_skipped_and_prefixes_isolated, memory_mode_never_touches_disk, roundtrip_with_special_chars, settings_defaults_and_remove |
+| `src/dro_blocklist.rs` | blocks_third_party_trackers, first_party_never_blocked, list_formats |
+| `src/dro_cache.rs` | fresh_then_stale_then_refresh, lru_eviction_by_bytes_and_entry_cap, parses_policy, policy_rules, touch_protects_recent_and_replace_updates_size |
+| `src/dro_charset.rs` | decode_bom_and_utf8, decode_latin1_and_cp1252, header_charset, meta_charset |
+| `src/dro_css_ext.rs` | at_rules_dropped, calc_eval, media_filtering, media_queries, units, vars |
+| `src/dro_dom_js.rs` | escapes, literal_shape |
+| `src/dro_font.rs` | bidi_fast_path_and_rtl, caret_stops_are_monotonic_and_cluster_aware, css_family_parsing, index_at_x_picks_nearest, latin_and_bangla_shape, lazy_loading_latin_loads_few_faces, line_break_opportunities, mask_raster_and_blit, renders_pixels, rtl_shaping_does_not_panic, style_builder_clamps, styles_change_width_and_cache_hits, synthetic_italic_shifts_top, web_font_rejects_garbage_and_woff |
+| `src/dro_media.rs` | bad_input_is_error, channel_conversion, resampler_ratio, wall_clock |
+| `src/dro_media_ui.rs` | draws_without_panic, hits, time_format |
+| `src/dro_net.rs` | cache_fresh_and_stale, cookie_basic_and_security, cookie_export_import_roundtrip, cookie_rejections_and_delete, data_urls_and_base64, domains, hsts_rules, http_dates, par_map_keeps_order, private_hosts, referrer_policy, sniff_and_decode, third_party_cookie_blocking |
+| `src/engine_host.rs` | bad_input_is_an_error_never_a_panic, big_stack_survives_deep_recursion_that_small_stacks_cannot, codec_roundtrip_all_commands_and_replies, drop_joins_thread, host_runs_commands_on_engine_thread, panic_inside_job_is_contained_and_engine_recovers, remote_engine_is_a_drop_in_with_crash_state, timeout_reports_busy_and_host_survives |
+| `src/forms.rs` | collects_successful_controls_in_order, empty_action_uses_page_url_and_find_form, encoding_roundtrip, get_replaces_query_and_drops_fragment, post_and_overrides_and_errors, select_defaults_to_first_option |
+| `src/input.rs` | bangla_clusters_move_together_backspace_by_codepoint, clipboard_cut_copy_paste_and_single_line_filter, mouse_mapping_and_password, multiline_up_down_keeps_column_and_enter, selection_replace_and_shift_arrows, single_line_enter_submits_and_max_len, typing_backspace_delete, undo_redo_coalesces_typing, word_movement_and_delete |
+| `src/js_engine.rs` | boa_evaluates, off_engine_refuses, unknown_engine_errors |
+| `src/safety.rs` | big_stack_deep_recursion, deadline_and_limits, guarded_catches_panic, log_ring_is_bounded, timeout_returns |
+| `src/sparrow_engine.rs` | blank_engine_state, escapes_html, load_html_sets_title_and_renders, recover_keeps_viewport_and_url, same_doc_needs_loaded_page |
+| `tests/fixes.rs` | bangla_fragment_scrolls_to_anchor, console_log_is_bounded, huge_viewport_is_rejected_not_allocated, image_without_data_shows_alt_text_and_renders, non_js_scripts_are_not_evaluated |
+| `tests/regression.rs` | all |
+| `tests/smoke.rs` | deep_nesting_does_not_kill_process, garbage_html_survives, history_is_ram_only, js_eval_works, loads_and_renders_pixels, recover_after_crash_flag, scroll_and_hit_test_never_panic |
 
----
-
-## 11. Known issues and limitations
-
-1. **Never compiled.** Expect API mismatches, especially: `boa_engine` 0.17 (`register_global_builtin_callable`, `runtime_limits_mut`, `Context<'static>`), `html5ever` 0.26 `TreeSink` signatures, `taffy` 0.4 field names (`Dimension::Length`, `compute_layout`), `tiny-skia` `Pattern::new` args.
-2. **Old Cargo (1.75) cannot resolve some latest transitive crates** that require `edition2024` (seen: `icu_properties_data`, `encoding_rs 0.8.44`). Use a current stable Rust, or pin with `cargo update -p <crate> --precise <ver>` (e.g. `url 2.5.0`).
-3. **`panic = "abort"` from the original spec was changed to `"unwind"`** because abort makes crash isolation impossible. Costs a little binary size.
-4. **`stylist`, `parley`, `vello`, `wgpu`, `winit`, `usvg` are not wired yet.** `stylist` will not be used at all.
-5. **Text:** only ASCII is drawn (bitmap font). Bangla/other scripts render as placeholder glyphs. Highest-priority functional gap.
-6. **Layout accuracy:** inline backgrounds/padding ignored; table columns don't align; `position`/`float`/grid missing; no margin collapsing.
-7. **Blocking network** on the calling thread; call from a worker thread.
-8. **Stack overflow / OOM / infinite Rust loops** cannot be caught by `catch_unwind`.
-9. **JS has no DOM**; most real websites rely on JS and will look empty or wrong.
-10. **Single global `thread_local` log** in `dro_js`: two engines on one thread share the log. Move into the runtime struct when DOM binding is added.
-11. `serde` is declared but barely used; remove or use for IPC/settings.
-12. HTTPS-only sites with unusual TLS configs may fail (rustls strictness); no certificate UI.
+Total named tests found: **109**.
 
 ---
 
-## 12. Performance plan ("Chromium-like")
+## Build blockers
 
-Honest baseline: a ~1.5k-line CPU renderer will not match Chromium. Chromium's speed comes from architecture, not one trick. The plan below lists the techniques and where they land.
+- `unicode-bidi` and `unicode-linebreak` are used by `dro_font.rs` but missing from `Cargo.toml`.
+- Phase-4 modules are not declared in `lib.rs`.
+- `rusqlite (bundled)` is still listed although Phase 4 removed SQLite.
+- If cargo is older than 1.80: `cargo update -p url --precise 2.5.0` and `cargo update -p encoding_rs --precise 0.8.34`.
+- Linux needs `libasound2-dev` for cpal.
 
-| Technique | Chromium analogue | Sparrow plan |
+---
+
+## Not covered yet
+
+### JavaScript
+
+- `fetch` / `XMLHttpRequest` (stubs reject)
+- ES modules, external `async` / `defer` semantics
+- interrupting an infinite loop inside `try/catch`
+
+### Networking and security
+
+- same-origin, CORS, CSP, mixed content
+- SameSite cookie enforcement
+- cache `Vary` handling
+- DNS-rebinding protection
+- process-global `dro_net::set_page` (wrong with several tabs)
+
+### Layout and paint
+
+- `white-space: pre` (plain text and JSON lose line breaks)
+- scroll containers, `overflow`
+- incremental style/layout/paint, tile cache
+- GPU rendering
+
+### Media
+
+- video frame decoding (only GIF and audio)
+- opus, wma
+- streaming, HLS, DASH, range playback
+- fullscreen, subtitles, playback rate
+
+### Input
+
+- focus management, tab order
+- caret and selection drawing
+- IME composition
+- clipboard bridge to the OS
+
+### Platform
+
+- process isolation
+- scheduler with frame budget and priorities
+- requestAnimationFrame
+- web fonts loading from `@font-face` end to end
+
+---
+
+## Roadmap
+
+| Step | Goal | Exit check |
 |---|---|---|
-| Multi-process + threads | browser/renderer/GPU/network processes | engine thread/process per tab, network service, worker pool (Phase 5–6) |
-| Incremental pipeline | style/layout/paint invalidation | dirty flags on DOM nodes; re-run only affected subtrees (Phase 3/5) |
-| GPU raster | Skia/GPU, compositor | `vello` + `wgpu`, layers, tiling (Phase 5) |
-| Text perf | glyph cache, HarfBuzz | `parley`/`swash` + glyph atlas (Phase 2) |
-| Network perf | HTTP/2, preconnect, cache | reqwest H2, connection reuse (already pooled), HTTP cache, resource priorities |
-| Parsing perf | streaming parser, preload scanner | stream html5ever, early CSS/image fetch (Phase 5) |
-| Memory | discardable images, caches | LRU caches, downscale on decode, budgets |
-| JS perf | V8 JIT | boa is an interpreter → expect slow JS; long-term option: evaluate other engines (needs library-list approval) |
-
-Measure first: add `criterion` benches for parse, style, layout, paint on fixed HTML fixtures; track time and peak memory per commit.
-
----
-
-## 13. Glossary
-
-- **Shell** – the outer Sparrow browser app (window, UI chrome). Calls the engine.
-- **Engine** – this crate: turns URLs/HTML into pixels and runs JS.
-- **DOM** – tree of nodes representing the document.
-- **Cascade** – process choosing final CSS values by specificity/importance/order.
-- **Computed style** – final per-element style (`Style`).
-- **Display list** – flat ordered list of drawing commands (`Vec<Item>`).
-- **Run / word box** – our inline layout trick: each word is a flex item in a wrapping row.
-- **Guard** – `catch_unwind` wrapper that keeps panics from reaching the shell.
-- **UA stylesheet** – built-in default CSS of the browser.
-- **Premultiplied alpha** – colour channels already multiplied by alpha (tiny-skia requirement).
-- **Viewport** – visible area (`w × h`); document may be taller → `scroll_y`.
-- **Dro** – internal prefix of engine modules.
+| 0 | Build is green | `cargo build` and `cargo test` pass |
+| 1 | Wire Phase 4 | modules declared, `RemoteEngine` in ffi/tabs, SQLite removed |
+| 2 | Forms + input + cache wired | submit works; typing in `<input>`; 304 revalidation |
+| 3 | `origin.rs` | same-origin, CORS, mixed-content, CSP tests |
+| 4 | `js_fetch.rs` | `fetch()` returns text/json through the origin checks |
+| 5 | `scheduler.rs` | 16 ms frame budget, rAF, per-tab page context |
+| 6 | `invalidate.rs` + `raster_cache.rs` | tile output equals full paint |
+| 7 | `process_host.rs` | child crash does not kill the shell |
+| 8 | Video frames | AV1 or platform decoder for MP4/WebM |
 
 ---
 
-*Owner: Kaif Alvi · Org: Codone · Project: Sparrow Browser. Keep this file current — it is the single source of truth for humans and AI assistants working on the engine.*
+## Engineering rules
+
+- No `unwrap`/`expect` outside tests; return `Result<_, String>`.
+- Never write to disk except bookmarks and settings.
+- Every new public method on the engine goes through `guard()`.
+- Every C export goes through `guard()` in `ffi.rs` and returns a code, never unwinds.
+- Keep files small; one concern per file; unit tests next to code.
+- Do not claim a feature works until a test proves it against the real crate.
+- Update `README.md` and `phases.md` with verified behaviour only.
 
 ---
 
-## Addendum — Phase 3 (fonts, media, tracker blocking)
+## Glossary
 
-| Module | Purpose | Verified |
-|---|---|---|
-| `dro_font.rs` | system fonts (`fontdb`) + OpenType shaping (`rustybuzz`) + AA outline rendering (tiny-skia); Bangla/Indic conjuncts, ligatures, per-char font fallback | compiled, 2 tests, rendered PNG checked visually |
-| `dro_media.rs` | pure-Rust audio player: `symphonia` decode, linear resampler, `cpal` output, audio-clock master, seek/volume/mute; animated GIF video; MP4 probe | compiled, 4 tests |
-| `dro_media_ui.rs` | Chromium-style control bar (play/pause, time, progress, mute, volume) draw + hit-test | compiled, 3 tests |
-| `sparrow_engine/media_bridge.rs` | `<video>/<audio>` slots, threaded download, JS commands, frame upload, overlay, click/key | type-checked against a stub engine |
-| `dro_blocklist.rs` | third-party tracker/ad blocking for sub-resources, hosts/ABP-style lists | compiled, 3 tests |
-| `dom_bootstrap.js` | + `HTMLMediaElement` API (`play/pause/currentTime/volume/muted/duration`, events) | 33 Node checks |
+- **Arena DOM**: nodes stored in a `Vec`, referenced by index (`NodeId`)
+- **Cascade**: CSS rule resolution into a computed `Style` per node
+- **Shaping**: turning text into positioned glyphs (rustybuzz)
+- **Bidi**: bidirectional text ordering (Arabic/Hebrew with Latin)
+- **Conjunct**: Bangla/Indic consonant cluster joined by a virama
+- **Virama**: combining mark that suppresses the inherent vowel (U+09CD for Bangla)
+- **Damage rect**: screen area that must be repainted
+- **CORS**: cross-origin resource sharing
+- **CSP**: content security policy
+- **HSTS**: forced HTTPS for a host
+- **RGBA frame**: premultiplied 8-bit pixels, `w * h * 4` bytes
+- **Handle**: opaque pointer the shell holds for one engine
 
-Not available in pure Rust today: H.264 / VP9 video decoding (only AV1 via `rav1d`, needs rustc >= 1.79). MP4/WebM audio plays; their pictures do not yet.
+---
+
+_Author: Kaif Alvi (Codone). Shell: Go + WebView. Engine: Rust._
+
+## Appendix: public function index
+
+- `abandoned_workers` in `src/safety.rs`
+- `active` in `src/browser/tabs.rs`
+- `add` in `src/browser/bookmark.rs`
+- `add` in `src/browser/history.rs`
+- `add` in `src/browser/store.rs`
+- `add_rule` in `src/dro_blocklist.rs`
+- `advance` in `src/dro_paint.rs`
+- `after_ms` in `src/safety.rs`
+- `append_child` in `src/dro_dom.rs`
+- `apply_js` in `src/sparrow_engine/bridge.rs`
+- `attr` in `src/dro_dom.rs`
+- `available` in `src/dro_font.rs`
+- `bidi_runs` in `src/dro_font.rs`
+- `bold` in `src/dro_font.rs`
+- `build_request` in `src/forms.rs`
+- `bytes` in `src/dro_cache.rs`
+- `cache_bytes` in `src/dro_net.rs`
+- `cache_clear` in `src/dro_net.rs`
+- `call` in `src/engine_host.rs`
+- `call_timeout` in `src/engine_host.rs`
+- `caret` in `src/input.rs`
+- `caret_stops` in `src/dro_font.rs`
+- `caret_stops` in `src/dro_font.rs`
+- `cells` in `src/dro_layout.rs`
+- `charset_from_header` in `src/dro_charset.rs`
+- `charset_from_meta` in `src/dro_charset.rs`
+- `check` in `src/safety.rs`
+- `clear` in `src/browser/history.rs`
+- `clear` in `src/browser/session.rs`
+- `clear` in `src/dro_cache.rs`
+- `clear` in `src/dro_net.rs`
+- `clear_all` in `src/dro_net.rs`
+- `clear_host` in `src/dro_net.rs`
+- `clear_logs` in `src/safety.rs`
+- `clear_session_data` in `src/sparrow_engine.rs`
+- `clear_web_fonts` in `src/dro_font.rs`
+- `clear_web_fonts` in `src/dro_font.rs`
+- `close` in `src/browser/tabs.rs`
+- `collect` in `src/forms.rs`
+- `compute` in `src/dro_css.rs`
+- `compute` in `src/dro_layout.rs`
+- `config` in `src/dro_net.rs`
+- `contains` in `src/browser/bookmark.rs`
+- `contains` in `src/browser/store.rs`
+- `cookie_count` in `src/dro_net.rs`
+- `cookies_clear` in `src/dro_net.rs`
+- `cookies_clear_host` in `src/dro_net.rs`
+- `cookies_export` in `src/dro_net.rs`
+- `cookies_import` in `src/dro_net.rs`
+- `count` in `src/dro_font.rs`
+- `create` in `src/dro_dom.rs`
+- `create` in `src/js_engine.rs`
+- `create_engine` in `src/lib.rs`
+- `current_time` in `src/dro_media.rs`
+- `decode` in `src/dro_charset.rs`
+- `decode` in `src/dro_net.rs`
+- `decode_image` in `src/dro_paint.rs`
+- `delete_since` in `src/browser/history.rs`
+- `descendants` in `src/dro_dom.rs`
+- `detach` in `src/dro_dom.rs`
+- `display_text` in `src/input.rs`
+- `document_height` in `src/sparrow_engine/bridge.rs`
+- `dom_literal` in `src/dro_dom_js.rs`
+- `draw` in `src/dro_font.rs`
+- `draw` in `src/dro_media_ui.rs`
+- `draw_decoration` in `src/dro_font.rs`
+- `draw_text` in `src/dro_font.rs`
+- `draw_text_style` in `src/dro_font.rs`
+- `dump_dom` in `src/sparrow_engine/bridge.rs`
+- `empty` in `src/dro_blocklist.rs`
+- `encode_pairs` in `src/forms.rs`
+- `ended` in `src/dro_media.rs`
+- `eval` in `src/dro_js.rs`
+- `eval_js` in `src/engine_host.rs`
+- `eval_js` in `src/sparrow_engine.rs`
+- `exec` in `src/engine_host.rs`
+- `execute` in `src/engine_host.rs`
+- `expired` in `src/safety.rs`
+- `export` in `src/dro_net.rs`
+- `families` in `src/dro_font.rs`
+- `fetch` in `src/dro_net.rs`
+- `fetch_max` in `src/dro_net.rs`
+- `fetch_range` in `src/dro_net.rs`
+- `fetch_sub` in `src/dro_net.rs`
+- `fetch_sub_page` in `src/dro_net.rs`
+- `find_form` in `src/forms.rs`
+- `find_in_page` in `src/engine_host.rs`
+- `find_in_page` in `src/sparrow_engine/bridge.rs`
+- `find_tag` in `src/dro_dom.rs`
+- `fire` in `src/dro_dom_js.rs`
+- `fire_event` in `src/engine_host.rs`
+- `fire_event` in `src/sparrow_engine/bridge.rs`
+- `fmt_time` in `src/dro_media_ui.rs`
+- `frame` in `src/dro_media.rs`
+- `from_bytes` in `src/engine_host.rs`
+- `from_bytes` in `src/engine_host.rs`
+- `get` in `src/browser/settings.rs`
+- `get` in `src/browser/store.rs`
+- `get` in `src/browser/store.rs`
+- `get` in `src/dro_net.rs`
+- `get_or` in `src/browser/settings.rs`
+- `get_or` in `src/browser/store.rs`
+- `global_blocked` in `src/dro_blocklist.rs`
+- `go_back` in `src/browser/tabs.rs`
+- `go_forward` in `src/browser/tabs.rs`
+- `handle_key` in `src/input.rs`
+- `has_audio` in `src/dro_media.rs`
+- `has_fonts` in `src/dro_font.rs`
+- `hit` in `src/dro_media_ui.rs`
+- `hit_test` in `src/engine_host.rs`
+- `hit_test` in `src/sparrow_engine.rs`
+- `import` in `src/dro_net.rs`
+- `index_at` in `src/input.rs`
+- `index_at_x` in `src/dro_font.rs`
+- `insert_before` in `src/dro_dom.rs`
+- `insert_str` in `src/input.rs`
+- `install` in `src/dro_dom_js.rs`
+- `install_page` in `src/sparrow_engine/bridge.rs`
+- `install_panic_hook` in `src/safety.rs`
+- `is_alive` in `src/engine_host.rs`
+
