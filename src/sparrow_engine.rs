@@ -1,25 +1,18 @@
+//! SparrowEngine: one page = DOM + styles + layout + JS + media. Everything is RAM-only.
+//! Child modules: `bridge` (page install, JS DOM, events, timers, find) and `media_bridge` (<video>/<audio>).
 use crate::dro_css::{self, Style};
 use crate::dro_dom::*;
 use crate::dro_js::JsRuntime;
 use crate::dro_layout::{self, Layout, Paint};
-use crate::{dro_html, dro_net, dro_paint};
+use crate::{dro_charset, dro_html, dro_net, dro_paint, safety};
+use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-mod media_bridge;
+use tiny_skia::Pixmap;
+
 mod bridge;
+mod media_bridge;
 
 pub const CRASH_MSG: &str = "Page crashed, reload?";
-const MAX_SHEETS: usize = 10;
-const JS_TYPES: [&str; 5] = ["text/javascript", "application/javascript", "application/x-javascript", "text/ecmascript", "application/ecmascript"];
-
-enum Src { Inline(String), Url(String) }
-
-fn is_js(t: Option<&str>) -> bool {
-    let t = t.unwrap_or("").trim();
-    t.is_empty() || JS_TYPES.iter().any(|m| t.eq_ignore_ascii_case(m))
-}
-fn is_sheet(rel: Option<&str>) -> bool {
-    rel.map_or(false, |r| r.split_whitespace().any(|t| t.eq_ignore_ascii_case("stylesheet")))
-}
 
 pub struct SparrowEngine {
     url: String,
@@ -32,11 +25,25 @@ pub struct SparrowEngine {
     scroll: f32,
     js: Option<JsRuntime>,
     crashed: bool,
+    // used by bridge.rs / media_bridge.rs
+    link_css: Vec<String>,
+    pending_nav: Option<String>,
+    images: HashMap<String, Pixmap>,
+    media: Vec<media_bridge::Slot>,
+}
+
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
 impl SparrowEngine {
     pub fn new() -> Self {
-        SparrowEngine { url: "about:blank".into(), title: String::new(), status: 0, dom: Dom::new(), styles: vec![], layout: None, vp: (1024, 768), scroll: 0.0, js: None, crashed: false }
+        safety::install_panic_hook(); // panics go to the RAM log, never to disk/console
+        SparrowEngine {
+            url: "about:blank".into(), title: String::new(), status: 0, dom: Dom::new(), styles: vec![], layout: None,
+            vp: (1024, 768), scroll: 0.0, js: None, crashed: false,
+            link_css: vec![], pending_nav: None, images: HashMap::new(), media: vec![],
+        }
     }
 
     /// Every public method goes through here: a panic never reaches the shell.
@@ -44,7 +51,7 @@ impl SparrowEngine {
         if self.crashed { return Err(CRASH_MSG.into()); }
         match catch_unwind(AssertUnwindSafe(|| f(self))) {
             Ok(r) => r,
-            Err(_) => { self.crashed = true; Err(CRASH_MSG.into()) }
+            Err(_) => { self.crashed = true; safety::log(format!("engine panic on {}", self.url)); Err(CRASH_MSG.into()) }
         }
     }
 
@@ -55,7 +62,21 @@ impl SparrowEngine {
     /// HTTP status of the last main-page load (0 = none).
     pub fn status(&self) -> u16 { self.status }
     pub fn viewport(&self) -> (u32, u32) { self.vp }
-    pub fn set_viewport(&mut self, w: u32, h: u32) { self.vp = (w.max(1), h.max(1)); self.layout = None; }
+    /// Re-styles for the new size (media queries, vw/vh).
+    pub fn set_viewport(&mut self, w: u32, h: u32) {
+        self.vp = (w.max(1), h.max(1));
+        self.layout = None;
+        let (w, h) = self.vp;
+        let _ = self.resize(w, h);
+    }
+    /// Network counters (requests, cache hits, blocked trackers, ...).
+    pub fn net_stats(&self) -> dro_net::Stats { dro_net::stats() }
+    /// "Clear browsing data": cookies, HTTP cache, HSTS (all RAM) + this page's images/JS storage.
+    pub fn clear_session_data(&mut self) {
+        dro_net::clear_all();
+        self.images.clear();
+        if self.js.is_some() { let _ = self.eval_js("try{localStorage.clear();sessionStorage.clear()}catch(e){}"); }
+    }
 
     pub fn reload(&mut self) -> Result<(), String> {
         if self.crashed { self.recover(); }
@@ -72,7 +93,7 @@ impl SparrowEngine {
         })
     }
 
-    /// Load raw HTML (no network); external stylesheets resolve against `base`.
+    /// Load raw HTML (no network for the page itself); sub-resources resolve against `base`.
     pub fn load_html(&mut self, html: &str, base: &str) -> Result<(), String> {
         if self.crashed { self.recover(); }
         let (h, b) = (html.to_string(), base.to_string());
@@ -101,51 +122,30 @@ impl SparrowEngine {
     fn fetch_page(&mut self, t: &str) -> Result<(), String> {
         if t.is_empty() || t == "about:blank" { return self.install("", "about:blank"); }
         let r = dro_net::fetch(t)?;
-        let ct = r.content_type.to_lowercase();
-        let text = dro_net::decode(&r.body, &r.content_type);
-        let html = if ct.contains("html") || ct.is_empty() { text }
-            else if ct.starts_with("text/") { format!("<pre>{}</pre>", text.replace('&', "&amp;").replace('<', "&lt;")) }
-            else { return Err(format!("Cannot display {ct}")); };
+        // trust the server's Content-Type; sniff only when it is missing/generic
+        let declared = r.content_type.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        let ct = if declared.is_empty() || declared == "application/octet-stream" { dro_net::sniff_mime(&r.body, &declared) } else { declared };
+        let texty = !r.body.iter().take(512).any(|&b| b == 0);
+        let html = if ct == "text/html" || ct == "application/xhtml+xml" || (ct == "application/octet-stream" && texty) {
+            dro_charset::decode(&r.body, &r.content_type)
+        } else if ct.starts_with("text/") || ct.ends_with("json") || ct.ends_with("javascript") || (ct.ends_with("xml") && !ct.starts_with("image/")) {
+            format!("<html><body><pre>{}</pre></body></html>", esc(&dro_charset::decode(&r.body, &r.content_type)))
+        } else if ct.starts_with("image/") && ct != "image/svg+xml" {
+            format!("<html><body><img src=\"{}\"></body></html>", esc(&r.url))
+        } else {
+            return Err(format!("Cannot display {ct}"));
+        };
         self.install(&html, &r.url)?;
         self.status = r.status;
         Ok(())
     }
 
-    /// Builds everything into locals first; state changes only on success.
+    /// Page install (bridge::install_page) + media slots for <video>/<audio>.
     fn install(&mut self, html: &str, base: &str) -> Result<(), String> {
-        let dom = dro_html::parse(html)?;
-        let title = dom.find_tag("title").map(|t| dom.text_content(t).trim().to_string()).unwrap_or_default();
-        let (mut srcs, mut scripts, mut links) = (vec![], vec![], 0);
-        for n in dom.descendants(0) {
-            match dom.tag(n) {
-                Some("style") => srcs.push(Src::Inline(dom.text_content(n))),
-                Some("script") if dom.attr(n, "src").is_none() && is_js(dom.attr(n, "type")) => scripts.push(dom.text_content(n)),
-                Some("link") if is_sheet(dom.attr(n, "rel")) && links < MAX_SHEETS => {
-                    if let Some(u) = dom.attr(n, "href").and_then(|h| dro_net::resolve(base, h)) { links += 1; srcs.push(Src::Url(u)); }
-                }
-                _ => {}
-            }
-        }
-        // external stylesheets are fetched in parallel, applied in document order
-        let css: Vec<String> = std::thread::scope(|s| {
-            let hs: Vec<_> = srcs.iter().map(|src| match src {
-                Src::Inline(t) => Err(t.clone()),
-                Src::Url(u) => Ok(s.spawn(move || dro_net::fetch_sub(u).map(|r| dro_net::decode(&r.body, &r.content_type)).unwrap_or_default())),
-            }).collect();
-            hs.into_iter().map(|h| match h { Err(t) => t, Ok(h) => h.join().unwrap_or_default() }).collect()
-        });
-        let mut rules = dro_css::parse(dro_css::UA);
-        for c in &css { rules.extend(dro_css::parse(c)); }
-        let styles = dro_css::compute(&dom, &rules);
-        let mut js = JsRuntime::new()?;
-        for s in &scripts { let _ = js.eval(s); } // script errors never break the page
-        self.url = base.to_string();
-        self.dom = dom;
-        self.title = title;
-        self.styles = styles;
-        self.js = Some(js);
-        self.layout = None;
-        self.scroll = 0.0;
+        dro_net::set_page(base);
+        self.install_page(html, base)?;
+        let b = self.url.clone();
+        self.setup_media(&b);
         Ok(())
     }
 
@@ -158,12 +158,15 @@ impl SparrowEngine {
         Ok(())
     }
 
-    /// Returns RGBA pixels (viewport width * height * 4).
+    /// Returns RGBA pixels (viewport width * height * 4); media control bars are overlaid.
     pub fn render(&mut self) -> Result<Vec<u8>, String> {
         self.guard(|e| {
             e.ensure_layout()?;
-            let l = e.layout.as_ref().ok_or("no layout")?;
-            dro_paint::paint(l, e.vp.0, e.vp.1, e.scroll)
+            let px = {
+                let l = e.layout.as_ref().ok_or("no layout")?;
+                dro_paint::paint(l, e.vp.0, e.vp.1, e.scroll)?
+            };
+            Ok(e.overlay_media(px))
         })
     }
 
@@ -171,7 +174,9 @@ impl SparrowEngine {
         let code = code.to_string();
         self.guard(move |e| {
             if e.js.is_none() { e.js = Some(JsRuntime::new()?); }
-            e.js.as_mut().ok_or("js unavailable")?.eval(&code)
+            let out = e.js.as_mut().ok_or("js unavailable")?.eval(&code);
+            e.apply_js()?; // pick up DOM changes / navigation made by the snippet
+            out
         })
     }
 
@@ -190,6 +195,7 @@ impl SparrowEngine {
     }
 
     /// Click at viewport (x, y). Returns resolved link URL if a link was hit.
+    /// (Shell: call `media_click` first; if it returns true, skip this.)
     pub fn hit_test(&self, x: f32, y: f32) -> Option<String> {
         let l = self.layout.as_ref()?;
         let y = y + self.scroll;
@@ -197,5 +203,32 @@ impl SparrowEngine {
             Paint::Word { link: Some(h), .. } if x >= it.x && x <= it.x + it.w && y >= it.y && y <= it.y + it.h => dro_net::resolve(&self.url, h),
             _ => None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test] fn escapes_html() { assert_eq!(esc("<a href=\"x\">&"), "&lt;a href=&quot;x&quot;&gt;&amp;"); }
+    #[test] fn blank_engine_state() {
+        let e = SparrowEngine::new();
+        assert_eq!(e.url(), "about:blank");
+        assert!(!e.is_crashed());
+        assert_eq!(e.status(), 0);
+    }
+    #[test] fn same_doc_needs_loaded_page() { assert!(SparrowEngine::new().same_doc("#x").is_none()); }
+    #[test] fn load_html_sets_title_and_renders() {
+        let mut e = SparrowEngine::new();
+        e.set_viewport(200, 100);
+        e.load_html("<title>T</title><p>hi", "https://example.com/").unwrap();
+        assert_eq!(e.title(), "T");
+        assert_eq!(e.render().unwrap().len(), 200 * 100 * 4);
+    }
+    #[test] fn recover_keeps_viewport_and_url() {
+        let mut e = SparrowEngine::new();
+        e.set_viewport(300, 200);
+        e.recover();
+        assert_eq!(e.viewport(), (300, 200));
+        assert!(!e.is_crashed());
     }
 }
