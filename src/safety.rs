@@ -100,9 +100,10 @@ pub mod limits {
     pub const MAX_DOM_DEPTH: usize = 512;
     pub const MAX_CSS_BYTES: usize = 2 * 1024 * 1024;
     pub const MAX_SCRIPT_BYTES: usize = 2 * 1024 * 1024;
-    pub const MAX_PIXELS: u64 = 8192 * 8192;
+    pub const MAX_PIXELS: u64 = 16_000_000; // 4000x4000 RGBA = 64 MB
+    pub const MAX_SIDE: u32 = 16_384;
     pub fn viewport_ok(w: u32, h: u32) -> Result<(), String> {
-        if w == 0 || h == 0 || (w as u64) * (h as u64) > MAX_PIXELS { Err(format!("bad viewport {w}x{h}")) } else { Ok(()) }
+        if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE || (w as u64) * (h as u64) > MAX_PIXELS { Err(format!("bad viewport {w}x{h}")) } else { Ok(()) }
     }
 }
 

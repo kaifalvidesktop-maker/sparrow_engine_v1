@@ -4,6 +4,7 @@
 
 use crate::dro_css::{Color, Display as CssDisplay, Style};
 use crate::dro_dom::{Dom, NodeId, NodeKind};
+use crate::dro_font;
 use crate::dro_paint::advance;
 use std::collections::{HashMap, HashSet};
 use taffy::prelude::*;
@@ -11,6 +12,8 @@ use taffy::prelude::*;
 pub enum Paint {
     Box(Color),
     Word { text: String, color: Color, size: f32, bold: bool, link: Option<String> },
+    /// `src` is an absolute image URL, or `media:<n>` for the n-th <video>/<audio>.
+    Image { src: String, link: Option<String> },
 }
 pub struct Item { pub x: f32, pub y: f32, pub w: f32, pub h: f32, pub paint: Paint }
 pub struct Layout { pub items: Vec<Item>, pub height: f32, pub bg: Color, pub anchors: HashMap<String, f32> }
@@ -132,6 +135,17 @@ struct B<'a> {
     vm: HashMap<taffy::NodeId, (f32, f32)>,
     /// Memoised nearest-`<a href>` lookup.
     links: HashMap<NodeId, Option<String>>,
+    base: &'a str,
+    /// Natural sizes of loaded images / video frames, keyed like `SparrowEngine::images`.
+    imgs: &'a HashMap<String, (u32, u32)>,
+    /// <video>/<audio> node -> index (document order; must match media_bridge::setup_media).
+    media_idx: HashMap<NodeId, usize>,
+    use_font: bool,
+    space_cache: HashMap<(u32, bool), f32>,
+}
+
+fn px_attr(dom: &Dom, n: NodeId, k: &str) -> Option<f32> {
+    dom.attr(n, k).and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok()).filter(|v| v.is_finite() && *v > 0.0)
 }
 
 impl<'a> B<'a> {
@@ -211,28 +225,53 @@ impl<'a> B<'a> {
         true
     }
 
+    /// Real shaped width (dro_font, handles Bangla) when fonts exist, else the cell model.
+    fn measure(&self, w: &str, size: f32, bold: bool) -> f32 {
+        if self.use_font {
+            let m = dro_font::measure(w, size, bold);
+            if m.is_finite() && m >= 0.0 { return m; }
+        }
+        word_cells(w) * advance(size)
+    }
+
+    fn space_w(&mut self, size: f32, bold: bool) -> f32 {
+        let key = (size.to_bits(), bold);
+        if let Some(&v) = self.space_cache.get(&key) { return v; }
+        let v = if self.use_font {
+            let m = dro_font::measure(" ", size, bold);
+            if m.is_finite() && m > 0.0 { m } else { advance(size) }
+        } else {
+            advance(size)
+        };
+        self.space_cache.insert(key, v);
+        v
+    }
+
     fn words(&mut self, parent: NodeId, text: &str, run: &mut Vec<taffy::NodeId>, avail: f32) -> R<()> {
         let st_all = self.st;
         let Some(Some(s)) = st_all.get(parent) else { return Ok(()) };
         let (size, color, bold) = (s.size, s.color, s.bold);
         let adv = advance(size);
+        let sp = self.space_w(size, bold);
         let link = self.link(parent);
 
-        if text.starts_with(is_ws) { self.widen_last_gap(run, adv)?; }
+        if text.starts_with(is_ws) { self.widen_last_gap(run, sp)?; }
 
         let ws: Vec<&str> = text.split(is_ws).filter(|w| !w.is_empty()).collect();
         let trail = text.ends_with(is_ws);
         let count = ws.len();
         for (i, w) in ws.iter().enumerate() {
-            let gap = if i + 1 < count || trail { adv } else { 0.0 };
-            let pieces: Vec<String> = if avail > 0.0 && word_cells(w) * adv > avail {
-                split_word(w, adv, avail)
+            let gap = if i + 1 < count || trail { sp } else { 0.0 };
+            let wpx = self.measure(w, size, bold);
+            let pieces: Vec<String> = if avail > 0.0 && wpx > avail {
+                let scale = wpx / (word_cells(w) * adv).max(0.01);
+                split_word(w, adv * scale, avail)
             } else {
                 vec![w.to_string()]
             };
             let last = pieces.len() - 1;
             for (j, piece) in pieces.into_iter().enumerate() {
-                let width = word_cells(&piece) * adv;
+                let width = self.measure(&piece, size, bold);
                 let g = if j == last { gap } else { 0.0 };
                 let style = taffy::Style {
                     size: Size { width: Dimension::Length(width), height: Dimension::Length(size * LINE) },
@@ -300,6 +339,8 @@ impl<'a> B<'a> {
                 NodeKind::Element { tag, .. } => {
                     let Some(Some(s)) = st_all.get(c) else { continue };
                     if s.display == CssDisplay::None { continue; }
+                    if tag == "img" { self.image(c, s, run, out, avail)?; continue; }
+                    if tag == "video" || tag == "audio" { self.media(c, tag == "audio", s, run, out, avail)?; continue; }
                     if tag == "br" {
                         // A <br> ends the line. If the line is empty (start of block or
                         // right after another <br>) it must still occupy one line height.
@@ -323,6 +364,78 @@ impl<'a> B<'a> {
                 _ => {}
             }
         }
+        Ok(())
+    }
+
+    fn leaf_image(&mut self, src: String, link: Option<String>, w: f32, h: f32, m: [f32; 4]) -> R<taffy::NodeId> {
+        let l = |v: f32| LengthPercentageAuto::Length(v);
+        let style = taffy::Style {
+            size: Size { width: Dimension::Length(w), height: Dimension::Length(h) },
+            margin: Rect { top: l(m[0]), right: l(m[1]), bottom: l(m[2]), left: l(m[3]) },
+            flex_shrink: 0.0,
+            ..Default::default()
+        };
+        let n = self.tree.new_leaf(style).map_err(err)?;
+        self.paints.insert(n, Paint::Image { src, link });
+        Ok(n)
+    }
+
+    fn image(&mut self, n: NodeId, s: &Style, run: &mut Vec<taffy::NodeId>, out: &mut Vec<taffy::NodeId>, avail: f32) -> R<()> {
+        let dom = self.dom;
+        let src = dom.attr(n, "src").and_then(|v| crate::dro_net::resolve(self.base, v)).unwrap_or_default();
+        let (nw, nh) = self.imgs.get(&src).map(|&(w, h)| (w as f32, h as f32)).unwrap_or((0.0, 0.0));
+        let known = nw > 0.0 && nh > 0.0;
+        let cw = s.width.filter(|v| *v > 0.0).or_else(|| px_attr(dom, n, "width"));
+        let ch = px_attr(dom, n, "height");
+        if !known && cw.is_none() && ch.is_none() {
+            // Not loaded and no size given: show the alt text, like a browser.
+            if let Some(alt) = dom.attr(n, "alt").map(|a| a.trim().to_string()).filter(|a| !a.is_empty()) {
+                self.words(n, &alt, run, avail)?;
+            }
+            return Ok(());
+        }
+        let ratio = if known { nw / nh } else { 4.0 / 3.0 };
+        let (mut w, mut h) = match (cw, ch) {
+            (Some(w), Some(h)) => (w, h),
+            (Some(w), None) => (w, w / ratio),
+            (None, Some(h)) => (h * ratio, h),
+            (None, None) => (nw, nh),
+        };
+        if w > avail && w > 0.0 { h *= avail / w; w = avail; }
+        let (w, h) = (w.clamp(1.0, 16384.0), h.clamp(1.0, 16384.0));
+        let block = s.display == CssDisplay::Block;
+        if block { self.flush(run, out)?; }
+        let link = self.link(n);
+        let m = [s.margin[0], s.margin[1], s.margin[2], s.margin[3]];
+        let leaf = self.leaf_image(src, link, w, h, m)?;
+        run.push(leaf);
+        if block { self.flush(run, out)?; }
+        Ok(())
+    }
+
+    fn media(&mut self, n: NodeId, audio: bool, s: &Style, run: &mut Vec<taffy::NodeId>, out: &mut Vec<taffy::NodeId>, avail: f32) -> R<()> {
+        self.flush(run, out)?;
+        let Some(&idx) = self.media_idx.get(&n) else { return Ok(()) };
+        let key = format!("media:{idx}");
+        let dom = self.dom;
+        let controls = dom.attr(n, "controls").is_some();
+        let (iw, ih) = self.imgs.get(&key).map(|&(a, b)| (a as f32, b as f32)).unwrap_or((0.0, 0.0));
+        let (mut w, mut h) = if audio {
+            if !controls { return Ok(()); }
+            (px_attr(dom, n, "width").unwrap_or(320.0), 36.0)
+        } else {
+            match (px_attr(dom, n, "width"), px_attr(dom, n, "height")) {
+                (Some(w), Some(h)) => (w, h),
+                (Some(w), None) => (w, if iw > 0.0 { w * ih / iw } else { w * 0.5625 }),
+                (None, Some(h)) => (if ih > 0.0 { h * iw / ih } else { h * 1.7778 }, h),
+                (None, None) => if iw > 0.0 { (iw, ih) } else { (300.0, 150.0) },
+            }
+        };
+        if w > avail && w > 0.0 { h *= avail / w; w = avail; }
+        let (w, h) = (w.clamp(1.0, 16384.0), h.clamp(1.0, 16384.0));
+        let m = [s.margin[0], s.margin[1], s.margin[2], s.margin[3]];
+        let leaf = self.leaf_image(key, None, w, h, m)?;
+        out.push(leaf);
         Ok(())
     }
 
@@ -398,10 +511,17 @@ impl<'a> B<'a> {
     }
 }
 
-pub fn compute(dom: &Dom, st: &[Option<Style>], width: f32) -> Result<Layout, String> {
+pub fn compute(dom: &Dom, st: &[Option<Style>], width: f32, base: &str, imgs: &HashMap<String, (u32, u32)>) -> Result<Layout, String> {
     let empty = || Layout { items: vec![], height: 0.0, bg: Color(255, 255, 255), anchors: HashMap::new() };
     let width = width.max(1.0); // also guards against NaN
 
+    let mut media_idx = HashMap::new();
+    for n in dom.descendants(0) {
+        if matches!(dom.tag(n), Some("video") | Some("audio")) {
+            let i = media_idx.len();
+            media_idx.insert(n, i);
+        }
+    }
     let mut b = B {
         dom,
         st,
@@ -413,6 +533,11 @@ pub fn compute(dom: &Dom, st: &[Option<Style>], width: f32) -> Result<Layout, St
         marks: HashSet::new(),
         vm: HashMap::new(),
         links: HashMap::new(),
+        base,
+        imgs,
+        media_idx,
+        use_font: dro_font::available(),
+        space_cache: HashMap::new(),
     };
     // Fragments without <html> fall back to <body>.
     let Some(root_dom) = dom.find_tag("html").or_else(|| dom.find_tag("body")) else { return Ok(empty()) };

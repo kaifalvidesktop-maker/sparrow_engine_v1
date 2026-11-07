@@ -315,6 +315,10 @@ fn client() -> Result<&'static reqwest::blocking::Client, String> {
             .referer(false)
             .redirect(reqwest::redirect::Policy::custom(|a| {
                 if a.previous().len() >= MAX_REDIRECTS { a.error("too many redirects") }
+                else if config().block_private_subresources && is_private_url(a.url()) && !a.previous().first().map_or(false, |u| is_private_url(u)) {
+                    BLOCKED.fetch_add(1, Relaxed);
+                    a.error("Blocked: redirect into private network")
+                }
                 else if !matches!(a.url().scheme(), "http" | "https") { a.stop() }
                 else { a.follow() }
             }));
@@ -461,7 +465,7 @@ fn exec(r: &Request, u: &url::Url, c: &Config) -> Result<Response, String> {
     if r.require_ok && !(200..300).contains(&status) { return Err(format!("HTTP {status}")); }
     if clen.map_or(false, |n| n > r.max_bytes) { return Err("Response too large".into()); }
     let mut body = Vec::new();
-    resp.take(r.max_bytes.saturating_add(1)).read_to_end(&mut body).map_err(|e| e.to_string())?;
+    resp.take(r.max_bytes + 1).read_to_end(&mut body).map_err(|e| e.to_string())?;
     if body.len() as u64 > r.max_bytes { return Err("Response too large".into()); }
     BYTES.fetch_add(body.len() as u64, Relaxed);
     let out = Response { url: final_url.to_string(), status, content_type, body };

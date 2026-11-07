@@ -5,7 +5,17 @@ thread_local! { static LOG: RefCell<Vec<String>> = RefCell::new(Vec::new()); }
 
 fn log(_: &JsValue, args: &[JsValue], c: &mut Context<'_>) -> JsResult<JsValue> {
     let s: Vec<String> = args.iter().map(|v| v.to_string(c).map(|s| s.to_std_string_escaped()).unwrap_or_default()).collect();
-    LOG.with(|l| l.borrow_mut().push(s.join(" ")));
+    let mut line = s.join(" ");
+    if line.len() > 4000 {
+        let mut cut = 4000;
+        while !line.is_char_boundary(cut) { cut -= 1; }
+        line.truncate(cut);
+    }
+    LOG.with(|l| {
+        let mut v = l.borrow_mut();
+        if v.len() >= 1000 { v.remove(0); } // bounded: console spam must not eat memory
+        v.push(line);
+    });
     Ok(JsValue::undefined())
 }
 

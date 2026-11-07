@@ -1,8 +1,6 @@
-# JS/DOM bridge implementation notes
+# Patches to apply on the existing code (all small). Two other AIs are debugging: apply on top of THEIR version.
 
-The changes described here are already present in the repository; this file is historical implementation guidance, not a patch set to apply again. Check the current source and `Cargo.toml` before relying on an older snippet. The Node/V8 checks below tested the bootstrap script separately and do **not** mean Sparrow uses V8. The engine's runtime is Boa; see `README.md` and `phases.md`.
-
-The numbered sections below preserve the original file-by-file integration notes.
+Everything new is in NEW files. Existing files need only these edits.
 
 ## 1. Cargo.toml
 ```toml
@@ -61,9 +59,9 @@ engine.run_timers(16); if let Some(u) = engine.take_navigation() { engine.load_u
 let px = engine.render()?;
 ```
 
-## Component checks recorded when these changes were prepared
+## Verified here (real compiler / node)
 - dro_charset.rs : `rustc --test` -> 4/4 pass
 - dro_css_ext.rs : `rustc --test` -> 6/6 pass
 - dro_dom_js.rs  : 2/2 pass (with stub JsRuntime)
 - dom_bootstrap.js : 24 checks pass in Node/V8 (selectors, events, timers, innerHTML, classList, style, location, storage)
-The component checks above do not establish that the current full crate compiles or that the bootstrap script works under the in-engine Boa runtime. The latest `cargo test` fails during compilation; see `phases.md`.
+## NOT verified (needs real deps): bridge.rs, ffi.rs, session.rs, settings.rs, and that boa 0.17 accepts dom_bootstrap.js

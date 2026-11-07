@@ -2,7 +2,8 @@
 
 use crate::dro_css::Color;
 use crate::dro_layout::{cells, is_virama, Layout, Paint};
-use tiny_skia::{Pixmap, Rect, Transform};
+use std::collections::HashMap;
+use tiny_skia::{FilterQuality, Pixmap, PixmapPaint, Rect, Transform};
 
 /// Horizontal advance of one character cell. `dro_layout` uses this for
 /// measuring, so it must stay in sync with how `text()` places glyphs.
@@ -75,6 +76,25 @@ fn glyph_index(ch: char) -> usize {
     if (' '..='~').contains(&ch) { ch as usize - 32 } else { 31 }
 }
 
+/// Decode PNG/JPEG/GIF into a premultiplied pixmap. Oversized images are rejected before decoding.
+pub fn decode_image(bytes: &[u8]) -> Result<Pixmap, String> {
+    const MAX_PX: u64 = 16_000_000;
+    let reader = || image::io::Reader::new(std::io::Cursor::new(bytes)).with_guessed_format().map_err(|e| e.to_string());
+    let (w, h) = reader()?.into_dimensions().map_err(|e| e.to_string())?;
+    if w == 0 || h == 0 || (w as u64) * (h as u64) > MAX_PX { return Err(format!("image too large: {w}x{h}")); }
+    let mut data = image::load_from_memory(bytes).map_err(|e| e.to_string())?.to_rgba8().into_raw();
+    for px in data.chunks_exact_mut(4) {
+        let a = px[3] as u32;
+        if a != 255 {
+            px[0] = ((px[0] as u32 * a + 127) / 255) as u8;
+            px[1] = ((px[1] as u32 * a + 127) / 255) as u8;
+            px[2] = ((px[2] as u32 * a + 127) / 255) as u8;
+        }
+    }
+    let size = tiny_skia::IntSize::from_wh(w, h).ok_or("bad image size")?;
+    Pixmap::from_vec(data, size).ok_or_else(|| "pixmap alloc failed".to_string())
+}
+
 fn rect(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, c: Color) {
     if ![x, y, w, h].iter().all(|v| v.is_finite()) { return; }
     // Snap to whole pixels: avoids tiny-skia's AA/hairline path (debug assert + slow).
@@ -89,6 +109,8 @@ fn rect(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, c: Color) {
 }
 
 fn text(pm: &mut Pixmap, t: &str, x: f32, y: f32, h: f32, size: f32, bold: bool, c: Color) {
+    // Real shaped text (Bangla etc.) when system fonts exist; the bitmap font below is the fallback.
+    if crate::dro_font::draw_text(pm, t, x, y, h, size, bold, (c.0, c.1, c.2)) { return; }
     let adv = advance(size);
     let s = adv / 6.0;
     let top = y + (h - 7.0 * s) / 2.0;
@@ -123,7 +145,7 @@ fn text(pm: &mut Pixmap, t: &str, x: f32, y: f32, h: f32, size: f32, bold: bool,
     }
 }
 
-pub fn paint(l: &Layout, w: u32, h: u32, scroll: f32) -> Result<Vec<u8>, String> {
+pub fn paint(l: &Layout, w: u32, h: u32, scroll: f32, images: &HashMap<String, Pixmap>) -> Result<Vec<u8>, String> {
     let (w, h) = (w.max(1), h.max(1));
     let mut pm = Pixmap::new(w, h).ok_or("pixmap alloc failed")?;
     pm.fill(tiny_skia::Color::from_rgba8(l.bg.0, l.bg.1, l.bg.2, 255));
@@ -138,6 +160,22 @@ pub fn paint(l: &Layout, w: u32, h: u32, scroll: f32) -> Result<Vec<u8>, String>
             Paint::Box(c) => {
                 // rect() enforces a 1px minimum for text strokes; empty boxes must stay invisible.
                 if it.w > 0.0 && it.h > 0.0 { rect(&mut pm, it.x, y, it.w, it.h, *c); }
+            }
+            Paint::Image { src, .. } => {
+                if it.w <= 0.0 || it.h <= 0.0 { continue; }
+                match images.get(src) {
+                    Some(img) if img.width() > 0 && img.height() > 0 => {
+                        let (sx, sy) = (it.w / img.width() as f32, it.h / img.height() as f32);
+                        let mut pp = PixmapPaint::default();
+                        pp.quality = if (sx - 1.0).abs() < 1e-3 && (sy - 1.0).abs() < 1e-3 { FilterQuality::Nearest } else { FilterQuality::Bilinear };
+                        pm.draw_pixmap(0, 0, img.as_ref(), &pp, Transform::from_row(sx, 0.0, 0.0, sy, it.x, y), None);
+                    }
+                    _ => {
+                        // not loaded yet: dark box for media, light box for pictures
+                        let c = if src.starts_with("media:") { Color(20, 20, 20) } else { Color(235, 235, 235) };
+                        rect(&mut pm, it.x, y, it.w, it.h, c);
+                    }
+                }
             }
             Paint::Word { text: t, color, size, bold, link } => {
                 text(&mut pm, t, it.x, y, it.h, *size, *bold, *color);

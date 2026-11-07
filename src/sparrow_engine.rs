@@ -32,6 +32,26 @@ pub struct SparrowEngine {
     media: Vec<media_bridge::Slot>,
 }
 
+/// Percent-decode a URL fragment (ids such as `#%E0%A6%AC` -> `ব`).
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hex = |c: u8| (c as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
@@ -64,9 +84,10 @@ impl SparrowEngine {
     pub fn viewport(&self) -> (u32, u32) { self.vp }
     /// Re-styles for the new size (media queries, vw/vh).
     pub fn set_viewport(&mut self, w: u32, h: u32) {
-        self.vp = (w.max(1), h.max(1));
+        let (w, h) = (w.max(1), h.max(1));
+        if safety::limits::viewport_ok(w, h).is_err() { return; }
+        self.vp = (w, h);
         self.layout = None;
-        let (w, h) = self.vp;
         let _ = self.resize(w, h);
     }
     /// Network counters (requests, cache hits, blocked trackers, ...).
@@ -114,8 +135,9 @@ impl SparrowEngine {
 
     fn jump(&mut self, full: &str, frag: &str) -> Result<(), String> {
         self.ensure_layout()?;
+        let key = pct_decode(frag);
         self.url = full.to_string();
-        self.scroll = if frag.is_empty() || frag == "top" { 0.0 } else { self.layout.as_ref().and_then(|l| l.anchors.get(frag).copied()).unwrap_or(self.scroll) };
+        self.scroll = if frag.is_empty() || frag == "top" { 0.0 } else { self.layout.as_ref().and_then(|l| l.anchors.get(frag).or_else(|| l.anchors.get(&key)).copied()).unwrap_or(self.scroll) };
         self.ensure_layout()
     }
 
@@ -151,7 +173,8 @@ impl SparrowEngine {
 
     fn ensure_layout(&mut self) -> Result<(), String> {
         if self.layout.is_none() {
-            self.layout = Some(dro_layout::compute(&self.dom, &self.styles, self.vp.0 as f32)?);
+            let sizes: HashMap<String, (u32, u32)> = self.images.iter().map(|(k, p)| (k.clone(), (p.width(), p.height()))).collect();
+            self.layout = Some(dro_layout::compute(&self.dom, &self.styles, self.vp.0 as f32, &self.url, &sizes)?);
         }
         let max = (self.layout.as_ref().map_or(0.0, |l| l.height) - self.vp.1 as f32).max(0.0);
         self.scroll = if self.scroll.is_finite() { self.scroll.clamp(0.0, max) } else { 0.0 };
@@ -164,7 +187,7 @@ impl SparrowEngine {
             e.ensure_layout()?;
             let px = {
                 let l = e.layout.as_ref().ok_or("no layout")?;
-                dro_paint::paint(l, e.vp.0, e.vp.1, e.scroll)?
+                dro_paint::paint(l, e.vp.0, e.vp.1, e.scroll, &e.images)?
             };
             Ok(e.overlay_media(px))
         })
@@ -200,7 +223,7 @@ impl SparrowEngine {
         let l = self.layout.as_ref()?;
         let y = y + self.scroll;
         l.items.iter().rev().find_map(|it| match &it.paint {
-            Paint::Word { link: Some(h), .. } if x >= it.x && x <= it.x + it.w && y >= it.y && y <= it.y + it.h => dro_net::resolve(&self.url, h),
+            Paint::Word { link: Some(h), .. } | Paint::Image { link: Some(h), .. } if x >= it.x && x <= it.x + it.w && y >= it.y && y <= it.y + it.h => dro_net::resolve(&self.url, h),
             _ => None,
         })
     }

@@ -9,6 +9,17 @@ enum Sc {
     Ext(usize),
 }
 
+/// Only classic JavaScript runs; JSON-LD, templates, modules etc. must not be eval'd.
+fn is_js_type(t: Option<&str>) -> bool {
+    match t {
+        None => true,
+        Some(t) => {
+            let t = t.trim().to_ascii_lowercase();
+            t.is_empty() || matches!(t.as_str(), "text/javascript" | "application/javascript" | "application/x-javascript" | "text/ecmascript" | "application/ecmascript" | "text/jscript" | "text/livescript")
+        }
+    }
+}
+
 fn title_of(dom: &Dom) -> String {
     dom.find_tag("title").map(|t| dom.text_content(t).trim().to_string()).unwrap_or_default()
 }
@@ -33,8 +44,14 @@ impl SparrowEngine {
 
     /// Full page install. Replaces the old `install` (call sites: load_url, load_html).
     pub(super) fn install_page(&mut self, html: &str, base: &str) -> Result<(), String> {
+        // Parse first: a failed install must not leave the old DOM under a new URL.
+        let dom = dro_html::parse(html)?;
+        if dom.nodes.len() > crate::safety::limits::MAX_DOM_NODES {
+            return Err(format!("page too large ({} nodes)", dom.nodes.len()));
+        }
         self.url = base.to_string();
-        self.dom = dro_html::parse(html)?;
+        self.dom = dom;
+        self.status = 0;
         self.scroll = 0.0;
         self.layout = None;
         self.images.clear();
@@ -56,6 +73,7 @@ impl SparrowEngine {
                         if u.starts_with("http") && !img_urls.contains(&u) && img_urls.len() < 40 { img_urls.push(u); }
                     }
                 }
+                Some("script") if !is_js_type(self.dom.attr(n, "type")) => {}
                 Some("script") => match self.dom.attr(n, "src") {
                     None => order.push(Sc::Inline(self.dom.text_content(n))),
                     Some(s) => {
@@ -85,6 +103,7 @@ impl SparrowEngine {
                 Sc::Inline(t) => t,
                 Sc::Ext(i) => match js_src.get(i) { Some(Some(t)) => t.clone(), _ => continue },
             };
+            if code.len() > crate::safety::limits::MAX_SCRIPT_BYTES { continue; }
             if let Err(e) = js.eval(&code) {
                 let _ = js.eval(&format!("__log({})", dro_dom_js::js_string(&e)));
             }
@@ -139,7 +158,8 @@ impl SparrowEngine {
     /// Re-run styling for a new viewport (media queries, vw/vh). Replaces the old `set_viewport` body.
     pub fn resize(&mut self, w: u32, h: u32) -> Result<(), String> {
         self.guard(move |e| {
-            e.vp = (w.max(1), h.max(1));
+            crate::safety::limits::viewport_ok(w, h)?; // huge sizes would abort the process on allocation
+            e.vp = (w, h);
             e.restyle();
             Ok(())
         })
